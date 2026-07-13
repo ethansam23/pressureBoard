@@ -1,0 +1,14 @@
+# Keil build output
+Objects/
+Listings/
+build_fixes.log
+
+# Keil per-user IDE state (window layout etc.)
+*.uvguix.*
+
+# J-Link debug logs
+JLinkLog.txt
+
+# Python
+__pycache__/
+*.pyc

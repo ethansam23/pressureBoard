@@ -1,0 +1,361 @@
+================================================================================
+  TLE9854QXW PROGRAMMING INTERFACE — QUICK REFERENCE
+  Based on: Infineon TLE9854QXW Datasheet Rev 1.2 (2023-03-20)
+  Companion doc: TLE985x Firmware User Manual (BootROM UM) — separate PDF
+================================================================================
+
+
+1. MEMORY MAP
+================================================================================
+
+  Address Range              Size     What
+  ─────────────────────────────────────────────────────────────────────────────
+  0x00000000 – 0x00005FFF    24 KB    Boot ROM (startup firmware, flash routines)
+  0x11000000 – 0x1100FFFF    64 KB    Flash (NVM) — user code and data
+  0x18000000 – 0x18000FFF     4 KB    SRAM
+  0x40000000 – 0x47FFFFFF     —       Peripheral Bus A0 (PBA0)
+  0x48000000 – 0x5FFFFFFF     —       Peripheral Bus A1 (PBA1)
+  0xE0000000 – 0xE00FFFFF     —       Private Peripheral Bus (Cortex-M0 debug)
+
+  Datasheet page: 36 (Section 9 — Address Space Organization, Figure 15)
+
+  Key addresses:
+    0x11000000  Vector table start (VTOR set here by BootROM before user entry)
+    0x11000004  Reset vector — BootROM reads this to find user code entry point
+                If 0xFFFFFFFF, chip enters sleep or waits for BSL
+
+
+2. FLASH (NVM) SPECIFICATIONS
+================================================================================
+
+  Parameter                   Value              Notes
+  ─────────────────────────────────────────────────────────────────────────────
+  Total size                  64 KB              Includes EEPROM emulated area
+  EEPROM emulated             4 KB               Emulated in flash, HW assisted
+  100TP memory                512 bytes          100 times programmable (option bytes)
+  Program page size           128 bytes          Minimum write granularity
+  Erase granularity           128 B (page) or 4 KB (sector)
+  Read access time            75 ns max
+  Page program time           3 ms typ / 3.5 ms max (raw)
+                              4 ms max (with FW routine overhead)
+  Page/sector erase time      4 ms typ / 4.5 ms max (raw)
+                              5 ms max (with FW routine overhead)
+  Endurance (user sectors)    30,000 erase/program cycles
+  Endurance (security pages)  10 cycles
+  Data retention              20 years @ 1000 cycles
+                              50 years @ 1000 cycles, Tj=30°C
+  Drain disturb limit         32,000 cycles
+  ECC                         Single-bit correction, double-bit detection
+                              On 64-bit (double word) data blocks
+  Read width                  8 bytes
+  Tj range for flash ops      -40°C to +150°C (full erase/write/read)
+                              +150°C to +165°C (erase/write/read)
+                              +165°C to +175°C (read only)
+
+  Datasheet pages: 39 (Section 10.3 — NVM Module features)
+                   115-116 (Section 29.4 — Flash Characteristics, Table 38)
+
+  CRITICAL NOTE from datasheet:
+    "The user has to ensure that no flash operations which change the
+     content of the flash get interrupted at any time."
+
+
+3. PROGRAMMING INTERFACE 1: SWD (Serial Wire Debug)
+================================================================================
+
+  Type:   Arm standard 2-wire debug protocol
+  Use:    Development, debugging, production flashing
+
+  3.1 PINS
+  ─────────────────────────────────────────────────────────────────────────────
+  Signal       Pin #   Port     Reset State   Function
+  SWD_CLK      24      P0.0     Input/PU      Serial Wire Debug clock
+  SWDIO/DAP1   23      TMS      Input/PD      Serial Wire Debug data (bidirectional)
+  RESET        25      —        I/O/PU        Bidirectional reset input/output
+  GNDP         21,30   —        —             Core supply ground
+  VDDP         44      —        —             I/O port supply (5.0V) — for VTref
+
+  Datasheet pages: 11-13 (Section 3.2 — Pin Definitions, Table 1)
+                   48 (Port 0 alternate function table, Table 6)
+
+  3.2 ENTERING DEBUG MODE
+  ─────────────────────────────────────────────────────────────────────────────
+  At the rising edge of RESET, two pins are sampled:
+
+    TMS (Pin 23) = HIGH   →  Debug mode entered
+    P0.2 (Pin 26) = LOW   →  Confirms debug entry
+
+  TMS has an internal pull-DOWN → defaults to NOT entering debug
+  P0.2 has an internal pull-DOWN → defaults to LOW (correct for debug)
+
+  The debugger (J-Link) drives TMS high during reset to enter debug mode.
+
+  Datasheet pages: 92 (Sections 28.3 and 28.4)
+
+  3.3 RECOMMENDED CIRCUIT
+  ─────────────────────────────────────────────────────────────────────────────
+  • Add 10kΩ external pull-down on TMS to GND
+    → Prevents accidental debug entry in production
+    → J-Link easily overdrives this to enter debug mode
+
+  • Ensure P0.2 is not driven HIGH externally during reset
+    → Internal pull-down handles it, just don't fight it
+
+  • Route to standard 10-pin SWD header (2x5, 1.27mm pitch):
+      Header Pin    Signal       → TLE9854 Pin
+      ──────────────────────────────────────────
+      1             VTref        → VDDP (Pin 44)
+      2             SWDIO        → TMS (Pin 23)
+      3             GND          → GNDP (Pin 21 or 30)
+      4             SWCLK        → P0.0 (Pin 24)
+      7             —            → not connected
+      10            nRESET       → RESET (Pin 25)
+
+  3.4 DEBUG MODE BEHAVIOR
+  ─────────────────────────────────────────────────────────────────────────────
+  • Watchdog (WDT1) is DISABLED in debug mode              (p.43)
+  • Full memory access: ROM, RAM, NVM, Config Sector       (p.37)
+  • Write/erase access to 100TP via debug interface        (p.39)
+  • Read-out protection can be enabled via security option  (p.39)
+
+  3.5 SUPPORTED DEBUG PROBE
+  ─────────────────────────────────────────────────────────────────────────────
+  Segger J-Link (any model supporting SWD + Cortex-M0):
+    J-Link EDU Mini — hobby/learning (~$20)
+    J-Link BASE     — commercial use (~$400)
+    J-Link PLUS     — faster (~$600)
+
+  The TLE985x Eval Board has an onboard Segger J-Link OB.
+
+  NOTE: SEGGER states TLE985x support comes without SEGGER warranty.
+  Support is through Infineon. Flash algorithms come from the Infineon
+  TLE985x Device Family Pack (DFP), not from SEGGER's generic database.
+
+  Required software:
+    • Segger J-Link driver (https://www.segger.com/downloads/jlink/)
+    • Infineon TLE985x DFP (install via Keil Pack Installer)
+    • Keil µVision5 IDE (or compatible toolchain)
+
+
+4. PROGRAMMING INTERFACE 2: LIN BSL (Bootstrap Loader)
+================================================================================
+
+  Type:   FastLIN protocol over integrated LIN transceiver
+  Use:    Production line flashing, field updates
+
+  4.1 PINS
+  ─────────────────────────────────────────────────────────────────────────────
+  Signal       Pin #   Type     Function
+  LIN          48      I/O      LIN bus interface (single wire, bidirectional)
+  GNDLIN       1       Power    LIN ground
+  VS           46      Power    Battery supply input (5.5V to 28V)
+
+  Datasheet pages: 12-13 (Pin Definitions)
+                   65-66 (Section 19 — LIN Transceiver)
+
+  4.2 BSL ENTRY CONDITIONS
+  ─────────────────────────────────────────────────────────────────────────────
+  The BootROM (24 KB ROM at 0x00000000) runs after every reset:
+
+  1. Checks reset vector at 0x11000004
+     → If 0xFFFFFFFF (erased/blank chip), enters BSL wait mode
+  2. Checks NAC (No Activity Counter) value
+     → After NAC timeout with no BSL communication, enters user mode
+     → If NVM double-bit ECC error on NAC read, waits for BSL indefinitely
+
+  BSL communication is LOCKED after reset. The host must send a
+  passphrase sequence to unlock it.
+
+  Full details: TLE985x Firmware User Manual (separate document)
+
+  4.3 LIN TRANSCEIVER MODES
+  ─────────────────────────────────────────────────────────────────────────────
+  Slope Mode          Baud Rate       Use Case
+  Normal              20 kbit/s       Standard LIN communication
+  Low Slope           10.4 kbit/s     EMC-sensitive applications
+  Fast Slope          62.5 kbit/s     Higher speed LIN
+  Flash Mode          115 kbit/s      End-of-line programming (standard)
+                      250 kbit/s      Production (point-to-point, short wire)
+
+  FastLIN BSL supports: 38.4 / 115.2 / 230.4 kBaud
+
+  Datasheet pages: 65 (Section 19.1 — LIN Features)
+                   126-127 (Table 47 — AC Characteristics Flash Mode)
+
+  4.4 LIN BSL CAPABILITIES (from BootROM Firmware User Manual)
+  ─────────────────────────────────────────────────────────────────────────────
+  • Write data to RAM
+  • Program NVM (flash) pages
+  • Erase NVM pages/sectors
+  • Execute code from RAM
+  • Set NVM protection passwords
+  • Reflash prepare
+
+  Max BSL message data buffer: 137 bytes (7 header + 130 EOT data)
+
+  4.5 PRODUCTION TOOL
+  ─────────────────────────────────────────────────────────────────────────────
+  Infineon µIO Stick — USB-to-LIN adapter for BSL programming
+  https://www.infineon.com/cms/en/product/evaluation-boards/uio-stick/
+
+
+5. NVM PROTECTION
+================================================================================
+
+  4 individual protection passwords covering separate regions:
+
+  Region                  Password Group
+  ─────────────────────────────────────────────────────────────────────────────
+  Customer BSL region     Group 1
+  Code region             Group 2
+  Data linear region      Group 3
+  Data mapped region      Group 4
+
+  Security features:
+  • Read-out protection via debug interface in application run mode
+  • Write/erase access to 100TP possible via debug interface
+  • BSL commands check NVM protection per command group
+
+  Datasheet page: 39 (Section 10.3)
+  Full details: TLE985x Firmware User Manual, Section 4.3 (BSL commands table)
+
+
+6. WATCHDOG BEHAVIOR DURING PROGRAMMING
+================================================================================
+
+  WDT1 state by mode:
+
+  Mode            WDT1 State    Notes
+  ─────────────────────────────────────────────────────────────────────────────
+  Active          ENABLED       Always on, cannot be deactivated
+  Debug           DISABLED      Automatically off — free to flash
+  Sleep           DISABLED
+  Stop            DISABLED
+
+  Programming-relevant windows:
+  • Long open window:   200 ms     After power-up, reset, wake-up
+  • Short open window:   30 ms     To facilitate flash programming
+  • Normal window:       Programmable (16, 32, 48, ... 1008 ms period)
+
+  Safety: After 5 missed WDT1 services → system shuts down to Sleep Mode
+
+  Datasheet pages: 43-44 (Section 13 — Watchdog Timer)
+
+
+7. BOOT ROM USER API FUNCTIONS (runtime flash access from user code)
+================================================================================
+
+  These are exported by the BootROM for user-mode software to call:
+
+  Function                     Description
+  ─────────────────────────────────────────────────────────────────────────────
+  user_nvm_page_erase          Erase a given NVM page
+  user_nvm_page_program        Program data to NVM page (128 bytes)
+  user_nvm_100tp_write         Write data to 100TP configuration NVM
+                               Supports partial page programming
+  user_nvm_sector_erase        Erase a 4 KB sector
+  (+ others)                   See BootROM User Manual Table 6-2
+
+  IMPORTANT: These functions are called from your application code at
+  runtime. They handle the actual flash hardware sequencing — you do NOT
+  write directly to flash registers. The NVM clock must be at system
+  frequency (fsys) for these to work correctly.
+
+  Full API reference: TLE985x Firmware User Manual, Section 6
+
+
+8. CLOCK CONFIGURATION FOR NVM ACCESS
+================================================================================
+
+  NVM access clock (NVMACCCLK) = up to 40 MHz
+  NVM clock (NVMCLK)           = up to 40 MHz (equals CPU clock)
+  CPU clock (CCLK)             = up to 40 MHz
+
+  NVMCLKFAC bit field sets the frequency factor between NVMACCCLK and CCLK.
+  Slow-down setting (CLKREL) reduces NVMACCCLK proportionally but does NOT
+  influence erase and write cycle timing.
+
+  Datasheet pages: 29-31 (Section 6.3 — Clock Generation Unit)
+
+
+9. DATASHEET PAGE INDEX — PROGRAMMING-RELATED SECTIONS
+================================================================================
+
+  Page   Section   Title
+  ─────────────────────────────────────────────────────────────────────────────
+    9    2         Block Diagram (system overview with debug interface)
+   11    3.2       Pin Definitions and Functions (SWD, TMS, RESET pins)
+   14    4         Modes of Operations (reset, active, sleep, stop)
+   26    6         SCU-DM (debug mode control, clock generation)
+   29    6.3       Clock Generation Unit (NVM clock configuration)
+   34    8         Arm Cortex-M0 Core (debug states, SW-DP block diagram)
+   35    8.2.1     Cortex-M0 Block Diagram (shows SW-DP, breakpoint unit)
+   36    9         Address Space Organization (memory map figure)
+   37    10        Memory Control Unit (NVM, RAM, ROM, MPU)
+   39    10.3      NVM Module (Flash Memory) *** MOST IMPORTANT PAGE ***
+   40    11        Interrupt System (NVM-related NMIs: map error, ECC)
+   43    13        Watchdog Timer (debug mode disable, flash windows)
+   48    14.3.1.1  Port 0 Functions (SWD_CLK alternate function)
+   65    19        LIN Transceiver (Flash Mode baud rates)
+   66    19.2.1    LIN Block Diagram
+   90    28.1      Window-Lift Application Diagram (reference schematic)
+   92    28.3      Connection of P0.2 for SWD debug mode ***
+   92    28.4      Connection of TMS ***
+  115    29.4      Flash Parameters
+  115    29.4.1    Flash Characteristics (Table 38 — timing, endurance)
+  122    29.6      LIN Transceiver electrical characteristics
+  126    —         Table 47: AC Characteristics - Flash Mode
+  155    31        Abbreviations (SWD, BSL, NVM, 100TP definitions)
+
+
+10. COMPANION DOCUMENTS (not included in this datasheet)
+================================================================================
+
+  Document                                    What it covers
+  ─────────────────────────────────────────────────────────────────────────────
+  TLE985x Firmware User Manual                BootROM startup procedure
+  (BootROM User Manual v2.0)                  BSL command frames & protocol
+                                              FastLIN passphrase/unlock
+                                              NAC boot logic
+                                              NVM User API function reference
+                                              100TP access procedures
+                                              Protection password management
+
+  TLE985xQX User's Manual                    Full register descriptions (SFRs)
+  (Reference Manual)                          Detailed peripheral operation
+                                              Clock system registers
+                                              NVM control registers
+
+  Arm Cortex-M0 Technical Reference Manual   SWD protocol specification
+  ARM Debug Interface Architecture Spec       DAP register-level details
+  (ADIv5.0 to ADIv5.2)
+
+  Available from:
+    Infineon: https://www.infineon.com (gated, requires registration)
+    CMSIS Pack: Infineon.TLE985x_DFP (includes both manuals as PDFs)
+    Install via Keil Pack Installer for easiest access
+
+
+11. DUAL-INTERFACE BOARD DESIGN SUMMARY
+================================================================================
+
+  For development (SWD):
+    • Place 10-pin SWD header (2x5, 1.27mm pitch)
+    • Wire: SWCLK→Pin24, SWDIO→Pin23, RST→Pin25, GND→Pin21, VTref→Pin44
+    • Add 10kΩ pull-down on TMS (Pin 23) to GND
+    • Ensure P0.2 (Pin 26) not driven high externally during reset
+
+  For production (LIN BSL):
+    • LIN (Pin 48) already routed to application connector
+    • GNDLIN (Pin 1) and VS (Pin 46) already in power circuit
+    • No additional hardware needed — uses application bus
+
+  The two paths share NO pins and do NOT interfere with each other.
+  The TMS pull-down is the only design element that bridges both worlds:
+  keeps debug OFF in production, allows J-Link to activate it for dev.
+
+
+================================================================================
+  END OF REFERENCE
+  Generated from Infineon TLE9854QXW Datasheet Rev 1.2
+================================================================================
