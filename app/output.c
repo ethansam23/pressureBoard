@@ -59,8 +59,10 @@ void output_set_pressure(uint16 counts)
 {
     uint32 duty;
     if (manual_override) { set_duty(manual_duty); return; }   /* re-assert after a fault episode */
-    if (counts > 1023u) { counts = 1023u; }
-    duty = (uint32)DUTY_LO + ((uint32)counts * (uint32)DUTY_SPAN) / 1023u;
+    /* Counts are 12-bit-scaled (0-4092) as of the oversample change; keep
+     * this doomed analog path correct until the link output replaces it.    */
+    if (counts > ADC_COUNTS_MAX) { counts = ADC_COUNTS_MAX; }
+    duty = (uint32)DUTY_LO + ((uint32)counts * (uint32)DUTY_SPAN) / ADC_COUNTS_MAX;
     set_duty((uint16)duty);
 }
 

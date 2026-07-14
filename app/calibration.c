@@ -10,7 +10,9 @@
  * only pushes the transient CAL_STORED pattern (solid 2 s).                 */
 
 /* ---- NVM layout (must fit in one 128-byte page) ------------------------- */
-#define CAL_MAGIC  0xCA11DA7Bu   /* bumped: cal points/coeffs now in bar, not psi */
+#define CAL_MAGIC  0xCA11DA7Cu   /* bumped: counts are now 12-bit-scaled — a
+                                  * slope fitted against 10-bit counts reads 4x
+                                  * wrong. Old cal is rejected; re-calibrate.  */
 
 typedef struct {
     uint32_t magic;

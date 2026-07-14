@@ -7,14 +7,16 @@
  * ADC1 acquisition — software-mode sampling of two probe channels.
  *
  * Each call to acquisition_run() samples both channels OVERSAMPLE_COUNT times
- * and averages each; `combined` is the configured probe source (A, B, or the
- * two-probe average — see PROBE_MODE_*).
+ * and divides the sum by OVERSAMPLE_DIV — production counts are 12-bit-SCALED
+ * (0..ADC_COUNTS_MAX = 4092), keeping 2 bits of oversampling gain. `combined`
+ * is the configured probe source (A, B, or the two-probe average — see
+ * PROBE_MODE_*). The RAW/SCAN diagnostics stay in native 10-bit ADC units.
  ******************************************************************************/
 
 typedef struct
 {
-    uint16 probe_a;         /* oversampled average, channel ADC_CH_PROBE_A    */
-    uint16 probe_b;         /* oversampled average, channel ADC_CH_PROBE_B    */
+    uint16 probe_a;         /* 12-bit-scaled average (0-4092), ADC_CH_PROBE_A */
+    uint16 probe_b;         /* 12-bit-scaled average (0-4092), ADC_CH_PROBE_B */
     uint16 combined;        /* selected probe source (A / B / average)        */
     bool   stalled;         /* true: >= one channel's worth of conversions
                              * fell back (EOC timeout / invalid result) this

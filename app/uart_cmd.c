@@ -441,7 +441,7 @@ static void print_raw(void)
 {
     acq_debug_t d;
     acquisition_debug(&d);
-    uart_send_str("RAW (P2.x inputs, 1 LSB ~5mV):\r\n");
+    uart_send_str("RAW (native 10-bit, 1 LSB ~5mV; production counts = 4x):\r\n");
     print_chan_raw("  A:", &d.a);
     print_chan_raw("  B:", &d.b);
 }
@@ -491,7 +491,7 @@ static void process_cmd(const char *cmd)
     else if (cmd_prefix(cmd, "THRESH "))
     {
         uint16 t = parse_u16(cmd + 7);
-        if (is_clean_u16(cmd + 7) && t > 0u && t <= 1023u)
+        if (is_clean_u16(cmd + 7) && t > 0u && t <= ADC_COUNTS_MAX)
         {
             nvm_config_set_disagree_thresh(t);
             if (nvm_config_save())
@@ -509,7 +509,7 @@ static void process_cmd(const char *cmd)
         }
         else
         {
-            uart_send_str("ERR: thresh 1-1023\r\n");
+            uart_send_str("ERR: thresh 1-4092\r\n");
         }
     }
     else if (cmd_prefix(cmd, "RATE "))
@@ -845,7 +845,7 @@ static void process_cmd(const char *cmd)
     }
     /* Bare keywords: print the command's usage instead of "unknown". */
     else if (cmd_eq(cmd, "RATE"))   { uart_send_str("ERR: RATE <100-5000 ms>\r\n"); }
-    else if (cmd_eq(cmd, "THRESH")) { uart_send_str("ERR: THRESH <1-1023>\r\n"); }
+    else if (cmd_eq(cmd, "THRESH")) { uart_send_str("ERR: THRESH <1-4092>\r\n"); }
     else if (cmd_eq(cmd, "RANGE"))  { uart_send_str("ERR: RANGE <lo> <hi> [PSI]  (0<=lo<hi<=1000 bar)\r\n"); }
     else if (cmd_eq(cmd, "PROBE"))  { uart_send_str("ERR: PROBE A|B|AVG\r\n"); }
     else if (cmd_eq(cmd, "OUTPUT")) { uart_send_str("ERR: OUTPUT <0-1023>|AUTO\r\n"); }

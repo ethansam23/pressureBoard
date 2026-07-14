@@ -63,6 +63,14 @@ static void sample_discard(uint8 ch)
     (void)ADC1_GetChResult(&val, ch);
 }
 
+/* Oversampling-gain sanity: the /4 below keeps exactly 2 of the 4 bits the
+ * 16x oversample can buy (1 bit per 4x), giving 12-bit-SCALED counts.       */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+_Static_assert(OVERSAMPLE_COUNT == 16u, "oversampling gain assumes 16 samples");
+_Static_assert(OVERSAMPLE_DIV == 4u,    "12-bit scaling assumes division by 4");
+_Static_assert(ADC_COUNTS_MAX == 4092u, "expected max is 16*1023/4");
+#endif
+
 static uint16 oversample(uint8 ch)
 {
     uint32 sum = 0u;
@@ -74,7 +82,11 @@ static uint16 oversample(uint8 ch)
     {
         sum += sample_one(ch);
     }
-    return (uint16)(sum / (uint32)OVERSAMPLE_COUNT);
+    /* /OVERSAMPLE_DIV (not /OVERSAMPLE_COUNT): production counts are
+     * 12-bit-scaled, 0-4092. The RAW/SCAN diagnostics below deliberately
+     * stay in native 10-bit ADC units (they diagnose the ADC itself) —
+     * bench displays differ from the production pipeline by 4x.             */
+    return (uint16)(sum / (uint32)OVERSAMPLE_DIV);
 }
 
 void acquisition_run(acq_result_t *result)
@@ -178,8 +190,14 @@ void acquisition_scan_channel(uint8 ch, acq_chan_debug_t *out)
 
 uint16 acquisition_counts_to_mv(uint16 counts)
 {
-    /* Both probe channels are P2.x inputs (same attenuation group). */
+    /* Both probe channels are P2.x inputs (same attenuation group).
+     * 12-bit-scaled input: the ideal full-scale denominator is 4096 (>>12),
+     * NOT ADC_COUNTS_MAX (4092 is just the max obtainable code). This is the
+     * exact algebraic image of the old 10-bit form ((c*fs - fs/2) >> 10) at
+     * 4x counts: (4c*fs - 2*fs) >> 12 == (c*fs - fs/2) >> 10. No overflow:
+     * 4092 * fs(~5000) + 2*fs < 2^32.                                       */
     uint32 fs = ADC1_GetChAttFactor(ADC_CH_PROBE_A);
-    if (counts == 0u) { return 0u; }
-    return (uint16)((((uint32)counts * fs) - (fs >> 1u)) >> 10u);
+    if (counts < 2u) { return 0u; }   /* counts*fs - 2*fs would underflow;
+                                       * 1 count is sub-millivolt anyway     */
+    return (uint16)((((uint32)counts * fs) - (fs << 1u)) >> 12u);
 }

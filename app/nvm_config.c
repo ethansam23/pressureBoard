@@ -6,7 +6,9 @@
 #include "tle985x.h"
 #include "sfr_access.h"
 
-#define SETTINGS_MAGIC  0x53455402u   /* "SET\x02" (layout v2: + pressure window) */
+#define SETTINGS_MAGIC  0x53455403u   /* "SET\x03" (v3: counts are 12-bit-scaled;
+                                       * a stored 10-bit disagree threshold would
+                                       * be 4x too tight -> force defaults)      */
 
 typedef struct {
     uint32_t magic;
@@ -52,7 +54,7 @@ void nvm_config_init(void)
         {
             rate_ms = REFRESH_RATE_DEFAULT_MS;
         }
-        if (disagree_thresh == 0u || disagree_thresh > 1023u)
+        if (disagree_thresh == 0u || disagree_thresh > ADC_COUNTS_MAX)
         {
             disagree_thresh = PROBE_DISAGREE_DEFAULT;
         }

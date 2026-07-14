@@ -29,6 +29,17 @@
 
 /* ---- Acquisition -------------------------------------------------------- */
 #define OVERSAMPLE_COUNT        16u     /* samples per channel per cycle       */
+#define OVERSAMPLE_DIV          4u      /* divide the 16-sample sum by 4, not
+                                         * 16: keeps 2 bits of the oversample
+                                         * -> 12-bit-SCALED counts, 0-4092.
+                                         * ("Effective bits" pending bench
+                                         * noise/dither evidence — see
+                                         * verification guide ENOB capture.)  */
+#define ADC_COUNTS_MAX          4092u   /* = 1023*16/4: MAX OBTAINABLE CODE of
+                                         * the oversampling operation. NEVER
+                                         * use as a conversion denominator —
+                                         * the ideal 12-bit full-scale divisor
+                                         * is 4096 (see counts_to_mv).        */
 #define ADC_EOC_TIMEOUT_SPINS   400u    /* EOC guard. At -O0 one spin iteration
                                          * is ~2.4 µs (3 non-inlined SDK calls),
                                          * so 400 ≈ 1 ms; healthy conversions
@@ -93,7 +104,8 @@
 #define SETTINGS_NVM_ADDR       0x1100FF00u /* second-to-last page            */
 
 /* ---- Fault thresholds --------------------------------------------------- */
-#define PROBE_DISAGREE_DEFAULT  20u     /* ~2 % FS at 10-bit (UART-settable)  */
+#define PROBE_DISAGREE_DEFAULT  80u     /* ~2 % FS in 12-bit-scaled counts
+                                         * (was 20 at 10-bit; UART-settable)  */
 
 /* ---- Probe source (UART-settable, NVM-persisted) ------------------------ */
 #define PROBE_MODE_DUAL         0u      /* average ProbeA & ProbeB (default)  */
