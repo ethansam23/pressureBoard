@@ -127,7 +127,7 @@ int main(void)
             if ((scheduler_get_ms() - vddext_t0) >= VDDEXT_SETTLE_TIMEOUT_MS)
             {
                 uart_send_str("WARN: VDDEXT not stable (excitation down)\r\n");
-                fault_raise_system();
+                fault_raise_vddext();
                 break;   /* proceed to the command loop anyway */
             }
         }
@@ -165,20 +165,27 @@ int main(void)
 
             /* System supervision: a dead/stalled ADC or a sagging VDDEXT
              * both make readings untrustworthy while the probes still AGREE
-             * (the disagreement check can't catch either). On VDDEXT
-             * instability, attempt a re-enable — recovers a latched-off
-             * regulator (overtemp/undervoltage), not just a sag.           */
+             * (the disagreement check can't catch either). The two causes
+             * are tracked independently so the output can report WHICH one
+             * is active. On VDDEXT instability, attempt a re-enable —
+             * recovers a latched-off regulator (overtemp/undervoltage),
+             * not just a sag.                                              */
             if (acq.stalled)
             {
-                fault_raise_system();
-            }
-            else if (vddext_stable() || PMU_VDDEXT_On())
-            {
-                fault_clear_system();
+                fault_raise_adc();
             }
             else
             {
-                fault_raise_system();
+                fault_clear_adc();
+            }
+
+            if (vddext_stable() || PMU_VDDEXT_On())
+            {
+                fault_clear_vddext();
+            }
+            else
+            {
+                fault_raise_vddext();
             }
 
             /* Fault check — disagreement only makes sense with two probes */
