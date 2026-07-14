@@ -1,7 +1,8 @@
 #include "uart_cmd.h"
 #include "app_config.h"
 #include "scheduler.h"
-#include "output.h"
+#include "link_tx.h"
+#include "link_frame.h"
 #include "calibration.h"
 #include "nvm_config.h"
 #include "fault.h"
@@ -10,10 +11,26 @@
 #include "port.h"
 #include "wdt1.h"
 
+/*******************************************************************************
+ * Bench console — debug builds only (LINK_CONSOLE_EN).
+ *
+ * UART2 is OWNED by the downhole link (link_tx.c). The console shares it
+ * under strict mutual exclusion:
+ *   - Boots LOCKED: no TX text, all commands ignored, until the exact line
+ *     "CONSOLE UNLOCK" arrives on RX. The stream stays pure packets.
+ *   - UNLOCK suspends the packet stream (after the in-flight packet
+ *     completes atomically) and gives the console the line.
+ *   - "CONSOLE LOCK", a 5-min RX-inactivity timeout, or a power cycle
+ *     re-locks: the console ring drains, the line goes idle for a full
+ *     inter-packet gap, then the stream resumes.
+ * Production builds (LINK_CONSOLE_EN=0) compile the console out entirely:
+ * uart_send_* become no-ops, RX is never enabled — packets are the only
+ * bytes this firmware can ever emit.
+ ******************************************************************************/
+
 /* ---- Ring buffers ------------------------------------------------------- */
 static volatile uint8  tx_buf[UART_TX_BUF_SIZE];
 static volatile uint16 tx_head, tx_tail;
-static volatile bool   tx_busy;
 
 static volatile uint8  rx_buf[UART_RX_BUF_SIZE];
 static volatile uint16 rx_head, rx_tail;
@@ -29,77 +46,129 @@ static uint16 rd_combined;
 
 /* ---- State -------------------------------------------------------------- */
 static bool   auto_print;
+#if LINK_CONSOLE_EN
+static bool   console_unlocked;   /* boot-locked; exact UNLOCK line opens it  */
+static bool   banner_pending;     /* banner prints once the line is granted   */
+static uint32 last_rx_tick;       /* inactivity auto-relock reference         */
+static uint32 boot_rst, boot_wfs; /* reset cause captured at boot by main     */
+#endif
 
 /* ---- Forward declarations ----------------------------------------------- */
-static void process_cmd(const char *cmd);
 static void uart_putc(uint8 c);
+#if LINK_CONSOLE_EN
+static void process_cmd(const char *cmd);
 static bool cmd_eq(const char *a, const char *b);
 static bool cmd_prefix(const char *cmd, const char *prefix);
 static uint16 parse_u16(const char *s);
 static float  parse_float(const char *s);
-static void   send_volts(uint16 duty);
-static const char *output_state(void);
+static void console_relock(void);
+static void print_banner(void);
+#endif
 
 /* ========================================================================= */
 /*  Public API                                                               */
 /* ========================================================================= */
 void uart_cmd_init(void)
 {
-    tx_head = 0u;  tx_tail = 0u;  tx_busy = false;
+    tx_head = 0u;  tx_tail = 0u;
     rx_head = 0u;  rx_tail = 0u;
     cmd_len = 0u;
     auto_print = false;
 
-    /* P1.0 = UART2 TXD (alt 3, output), P1.1 = UART2 RXD (input, fixed) */
-    PORT_P10_Output_Set();
-    PORT_ChangePinAlt(0x10u, 3u);      /* P1.0 → UART2 TX (alt 3) */
+#if LINK_CONSOLE_EN
+    console_unlocked = false;      /* BOOTS LOCKED — stream stays pure        */
+    banner_pending   = false;
+    last_rx_tick     = scheduler_get_ms();
+    boot_rst = 0u; boot_wfs = 0u;
 
-    /* Config Wizard leaves SCON = 0 (synchronous mode).
-     * Set SM1 = 1 for Mode 1: 8-bit UART, variable baud rate. */
-    UART2->SCON.reg |= (uint32)(1u << 6u);
-
-    UART2_BaudRate_Set(UART_BAUD);
+    /* UART2 pins / mode / baud / NVIC are owned by link_tx_init() (which
+     * runs first). The console only adds the RECEIVER + RX interrupt.       */
     UART2_Receiver_En();
 
-    /* Drain any spurious byte latched while the Rx line settled, and clear the
-     * RX flag, so the FIRST real command isn't corrupted by leading garbage. */
+    /* Drain any spurious byte latched while the Rx line settled, and clear
+     * the RX flag, so the FIRST real command isn't corrupted by garbage.    */
     (void)UART2_Buffer_Get();
     UART2_RX_Int_Clr();
-
-    /* Enable UART2 NVIC (IRQ 11) and module-level RX interrupt.
-     * TX interrupt is enabled on-demand when data is queued. */
-    CPU->NVIC_ISER.reg |= (1u << 11u);
     UART2_RX_Int_En();
+#endif
+}
 
-    uart_send_str("\r\n== Pressure Transmitter v1 ==\r\n");
+void uart_cmd_set_boot_info(uint32 rst, uint32 wfs)
+{
+#if LINK_CONSOLE_EN
+    boot_rst = rst;
+    boot_wfs = wfs;
+#else
+    (void)rst; (void)wfs;
+#endif
 }
 
 void uart_cmd_service(void)
 {
+#if LINK_CONSOLE_EN
+    uint32 now = scheduler_get_ms();
+
+    /* Deferred unlock banner: the link reports when the in-flight packet
+     * has completed and the console owns the line.                          */
+    if (banner_pending && link_tx_console_active())
+    {
+        banner_pending = false;
+        print_banner();
+    }
+
+    /* Inactivity auto-relock: covers a crashed host app, an unplugged
+     * adapter, or a forgotten bench session — the board re-arms the
+     * packet stream on its own.                                             */
+    if (console_unlocked && !banner_pending &&
+        ((now - last_rx_tick) >= LINK_CONSOLE_RELOCK_MS))
+    {
+        console_relock();
+    }
+
+    /* Keep the console ring draining while we own the line.                 */
+    if (link_tx_console_active()) { link_tx_console_kick(); }
+
     /* --- Pull bytes from RX ring buffer into command line buffer --------- */
     while (rx_head != rx_tail)
     {
         uint8 b = rx_buf[rx_tail];
         rx_tail = (rx_tail + 1u) % UART_RX_BUF_SIZE;
+        last_rx_tick = now;
 
         if (b == '\r' || b == '\n')
         {
-            /* Process on Enter. Blank lines (and the LF of a CR-LF pair, since
-             * cmd_len is already 0) are ignored without echoing. */
+            /* Process on Enter. Blank lines (and the LF of a CR-LF pair,
+             * since cmd_len is already 0) are ignored without echoing.      */
             if (cmd_len > 0u)
             {
-                uart_send_str("\r\n");
-                /* Trim trailing spaces so "STATUS " matches STATUS. */
+                /* Trim trailing spaces so "STATUS " matches STATUS.         */
                 while (cmd_len > 0u && cmd_buf[cmd_len - 1u] == (uint8)' ')
                 {
                     cmd_len--;
                 }
                 cmd_buf[cmd_len] = '\0';
-                process_cmd((const char *)cmd_buf);
+
+                if (!console_unlocked)
+                {
+                    /* LOCKED: exactly one line is recognized; everything
+                     * else is silently ignored (no echo, no error — the
+                     * line must stay packet-pure).                          */
+                    if (cmd_eq((const char *)cmd_buf, "CONSOLE UNLOCK"))
+                    {
+                        console_unlocked = true;
+                        banner_pending   = true;
+                        link_tx_request_console();
+                    }
+                }
+                else
+                {
+                    uart_send_str("\r\n");
+                    process_cmd((const char *)cmd_buf);
+                }
                 cmd_len = 0u;
                 /* At most ONE command per service pass: a pasted batch of
                  * RAW/SCAN lines would otherwise run hundreds of conversions
-                 * between WDT1 services. Remaining bytes wait one loop pass. */
+                 * between WDT1 services. Remaining bytes wait one pass.     */
                 break;
             }
         }
@@ -108,7 +177,7 @@ void uart_cmd_service(void)
             if (cmd_len > 0u)
             {
                 cmd_len--;
-                uart_send_str("\b \b");         /* erase the char on the terminal */
+                uart_send_str("\b \b");         /* no-op while locked */
             }
         }
         else if (b >= 0x20u && b <= 0x7Eu)      /* printable ASCII only */
@@ -116,12 +185,13 @@ void uart_cmd_service(void)
             if (cmd_len < (UART_CMD_BUF_SIZE - 1u))
             {
                 cmd_buf[cmd_len++] = b;
-                uart_putc(b);                   /* echo so the user sees input */
+                uart_putc(b);                   /* echo (no-op while locked) */
             }
             /* else: line full -> drop extra chars silently */
         }
-        /* else: control / line-noise byte -> ignore (kills startup garbage) */
+        /* else: control / line-noise byte -> ignore                         */
     }
+#endif
 }
 
 void uart_cmd_update_readings(uint16 probe_a, uint16 probe_b, uint16 combined)
@@ -130,10 +200,12 @@ void uart_cmd_update_readings(uint16 probe_a, uint16 probe_b, uint16 combined)
     rd_probe_b  = probe_b;
     rd_combined = combined;
 
-    if (auto_print)
+#if LINK_CONSOLE_EN
+    if (auto_print && console_unlocked)
     {
-        /* Debug stream: counts + mV per probe, pressure (if cal'd), the actual
-         * output voltage, and which path is driving it (FLT/MAN/CAL/RAW). */
+        /* Debug stream: counts + mV per probe, pressure (if cal'd), and the
+         * link code that WOULD be on the wire (stream is suspended while
+         * the console is unlocked) plus which path produced it.             */
         uart_send_str("A:");     uart_send_u16(probe_a);
         uart_send_str(" ");      uart_send_u16(acquisition_counts_to_mv(probe_a));
         uart_send_str("mV  B:"); uart_send_u16(probe_b);
@@ -151,12 +223,16 @@ void uart_cmd_update_readings(uint16 probe_a, uint16 probe_b, uint16 combined)
             uart_send_str("uncal");
         }
 
-        uart_send_str("  Out:");
-        send_volts(output_get_duty());
-        uart_send_str("V ");
-        uart_send_str(output_state());
+        uart_send_str("  Link:0x");
+        uart_send_hex16(link_tx_get_live_code());
+        uart_send_str(" ");
+        if (link_tx_is_test())           { uart_send_str("TST"); }
+        else if (fault_is_active())      { uart_send_str("FLT"); }
+        else if (calibration_is_valid()) { uart_send_str("CAL"); }
+        else                             { uart_send_str("UNC"); }
         uart_send_str("\r\n");
     }
+#endif
 }
 
 void uart_send_str(const char *s)
@@ -173,6 +249,7 @@ void uart_send_str(const char *s)
 /* ========================================================================= */
 void uart_cmd_rx_isr(void)
 {
+#if LINK_CONSOLE_EN
     uint8  b    = UART2_Buffer_Get();
     uint16 next = (rx_head + 1u) % UART_RX_BUF_SIZE;
     if (next != rx_tail)            /* room in buffer */
@@ -181,20 +258,34 @@ void uart_cmd_rx_isr(void)
         rx_head = next;
     }
     /* overflow: drop byte */
+#endif
 }
 
 void uart_cmd_tx_isr(void)
 {
-    if (tx_head != tx_tail)
-    {
-        UART2_Buffer_Set(tx_buf[tx_tail]);
-        tx_tail = (tx_tail + 1u) % UART_TX_BUF_SIZE;
-    }
-    else
-    {
-        tx_busy = false;
-        UART2_TX_Int_Dis();
-    }
+    /* isr_defines.h (vendor config, untouched) wires the UART2 TX callback
+     * to this name. The link module is the single TX arbiter — packet
+     * bursts always win; console bytes flow only in bench console mode.    */
+    link_tx_tx_isr();
+}
+
+/* ISR/kick-context console-ring accessors for the link arbiter.             */
+bool uart_cmd_console_pop(uint8 *b)
+{
+#if LINK_CONSOLE_EN
+    if (tx_head == tx_tail) { return false; }
+    *b = tx_buf[tx_tail];
+    tx_tail = (tx_tail + 1u) % UART_TX_BUF_SIZE;
+    return true;
+#else
+    (void)b;
+    return false;
+#endif
+}
+
+bool uart_cmd_console_ring_empty(void)
+{
+    return (tx_head == tx_tail);
 }
 
 /* ========================================================================= */
@@ -202,22 +293,18 @@ void uart_cmd_tx_isr(void)
 /* ========================================================================= */
 static void uart_putc(uint8 c)
 {
-    uint16 next = (tx_head + 1u) % UART_TX_BUF_SIZE;
-    if (next == tx_tail) { return; }  /* buffer full — drop */
-
-    __disable_irq();
+#if LINK_CONSOLE_EN
+    uint16 next;
+    if (!console_unlocked) { return; }  /* locked: the line stays packet-pure */
+    next = (tx_head + 1u) % UART_TX_BUF_SIZE;
+    if (next == tx_tail) { return; }    /* buffer full — drop                 */
     tx_buf[tx_head] = c;
     tx_head = next;
-
-    if (!tx_busy)
-    {
-        tx_busy = true;
-        /* Prime the transmitter with the first byte. */
-        UART2_Buffer_Set(tx_buf[tx_tail]);
-        tx_tail = (tx_tail + 1u) % UART_TX_BUF_SIZE;
-        UART2_TX_Int_En();
-    }
-    __enable_irq();
+    link_tx_console_kick();             /* primes hardware iff console owns
+                                         * the line and it is idle           */
+#else
+    (void)c;                            /* production: console TX impossible  */
+#endif
 }
 
 void uart_send_u16(uint16 val)
@@ -233,6 +320,19 @@ void uart_send_u16(uint16 val)
     while (i > 0u) { uart_putc((uint8)buf[--i]); }
 }
 
+void uart_send_u32(uint32 val)
+{
+    char  buf[10];
+    uint8 i = 0u;
+    if (val == 0u) { uart_putc('0'); return; }
+    while (val > 0u)
+    {
+        buf[i++] = (char)('0' + (uint8)(val % 10u));
+        val /= 10u;
+    }
+    while (i > 0u) { uart_putc((uint8)buf[--i]); }
+}
+
 void uart_send_i32(sint32 val)
 {
     if (val < 0) { uart_putc((uint8)'-'); val = -val; }
@@ -241,12 +341,16 @@ void uart_send_i32(sint32 val)
 
 void uart_tx_flush_bounded(void)
 {
+#if LINK_CONSOLE_EN
     uint32 t0 = scheduler_get_ms();
-    while (tx_busy || (tx_head != tx_tail))
+    if (!link_tx_console_active()) { return; }  /* nothing drains in pkt mode */
+    while (tx_head != tx_tail)
     {
+        link_tx_console_kick();
         (void)WDT1_Service();
-        if ((scheduler_get_ms() - t0) >= 200u) { break; }   /* 1 KB drains in <90 ms */
+        if ((scheduler_get_ms() - t0) >= 1500u) { break; }  /* 1KB @960B/s    */
     }
+#endif
 }
 
 void uart_send_hex16(uint16 val)
@@ -272,6 +376,8 @@ void uart_send_float3(float f)
     if (frac < 10u)  { uart_putc('0'); }
     uart_send_u16(frac);
 }
+
+#if LINK_CONSOLE_EN
 
 static bool cmd_eq(const char *a, const char *b)
 {
@@ -373,19 +479,30 @@ static float parse_float(const char *s)
     return neg ? -result : result;
 }
 
-/* Current PWM duty -> filtered output voltage (assumes 0..OUT_V_SUPPLY span). */
-static void send_volts(uint16 duty)
+static void print_banner(void)
 {
-    uart_send_float3((float)duty / (float)(PWM_MAX_COUNT - 1u) * OUT_V_SUPPLY);
+    uart_send_str("\r\n== Pressure Transmitter v2 (digital link) ==\r\n");
+    uart_send_str("Console UNLOCKED — packet stream SUSPENDED (CONSOLE LOCK to resume)\r\n");
+    uart_send_str("Boot RST 0x"); uart_send_hex16((uint16)boot_rst);
+    uart_send_str(" WFS 0x");     uart_send_hex16((uint16)boot_wfs);
+    if ((boot_rst & PMU_RESET_STS_PMU_ExtWDT_Msk) != 0u) { uart_send_str(" [WDT1]"); }
+    if ((boot_rst & PMU_RESET_STS_PMU_VS_POR_Msk) != 0u) { uart_send_str(" [POR]");  }
+    if ((boot_rst & PMU_RESET_STS_PMU_PIN_Msk)    != 0u) { uart_send_str(" [PIN]");  }
+    uart_send_str("\r\n");
+    if (!nvm_flash_is_healthy())
+    {
+        uart_send_str("WARN: NVM data flash inconsistent (saves disabled)\r\n");
+    }
 }
 
-/* Which path is actually driving the output, in priority order. */
-static const char *output_state(void)
+static void console_relock(void)
 {
-    if (fault_is_active())      { return "FLT"; }
-    if (output_is_manual())     { return "MAN"; }
-    if (calibration_is_valid()) { return "CAL"; }
-    return "RAW";
+    /* Goodbye line is queued while still unlocked; it drains during the
+     * link's RESUMING phase, then the line goes quiet and packets resume.  */
+    uart_send_str("Console LOCKED — packet stream resuming\r\n");
+    console_unlocked = false;
+    auto_print       = false;    /* a forgotten AUTO must not re-arm later   */
+    link_tx_request_packet();
 }
 
 static void print_status(void)
@@ -399,16 +516,29 @@ static void print_status(void)
     uart_send_str((pm == PROBE_MODE_A) ? "A" : ((pm == PROBE_MODE_B) ? "B" : "AVG"));
     uart_send_str("\r\n");
 
-    uart_send_str("Output: ");   send_volts(output_get_duty());
-    uart_send_str("V  ");        uart_send_str(output_is_manual() ? "MANUAL" : "AUTO");
-    uart_send_str("  Fault: ");  uart_send_str(fault_is_active() ? "YES" : "no");
+    uart_send_str("Link: 0x");   uart_send_hex16(link_tx_get_live_code());
+    uart_send_str(link_tx_is_test() ? "  TEST(!)" : "  LIVE");
+    uart_send_str("  mode=");
+    uart_send_str(link_tx_console_active() ? "CONSOLE (stream suspended)" : "PKT");
+    uart_send_str("  pkts=");    uart_send_u32(link_tx_get_pkt_count());
+    uart_send_str(" aborts=");   uart_send_u16(link_tx_get_abort_total());
+    uart_send_str(" skips=");    uart_send_u16(link_tx_get_busy_skips());
+    uart_send_str("\r\n");
+
+    uart_send_str("Faults: ");
+    if (!fault_is_active()) { uart_send_str("none"); }
+    else
+    {
+        if (fault_adc_active())      { uart_send_str("ADC_STALL "); }
+        if (fault_vddext_active())   { uart_send_str("VDDEXT ");    }
+        if (fault_disagree_active()) { uart_send_str("DISAGREE");   }
+    }
     uart_send_str("\r\n");
 
     uart_send_str("Rate: ");       uart_send_u16((uint16)scheduler_get_rate_ms());
     uart_send_str("ms  Thresh: "); uart_send_u16(nvm_config_get_disagree_thresh());
-    uart_send_str("  Range: ");    uart_send_float3(nvm_config_get_range_lo_bar());
-    uart_send_str("-");            uart_send_float3(nvm_config_get_range_hi_bar());
-    uart_send_str(" bar\r\n");
+    uart_send_str("  NVM: ");      uart_send_str(nvm_flash_is_healthy() ? "ok" : "INCONSISTENT");
+    uart_send_str("\r\n");
 
     uart_send_str("Cal: ");
     if (calibration_is_valid())
@@ -477,6 +607,8 @@ static void process_cmd(const char *cmd)
     }
     else if (cmd_eq(cmd, "RAW"))
     {
+        /* ~34 ms of conversions — safe here: commands only run in console
+         * mode, where the packet stream is suspended (nothing to tear).    */
         print_raw();
     }
     else if (cmd_eq(cmd, "SCAN"))
@@ -487,6 +619,36 @@ static void process_cmd(const char *cmd)
     {
         auto_print = !auto_print;
         uart_send_str(auto_print ? "Auto ON\r\n" : "Auto OFF\r\n");
+    }
+    else if (cmd_eq(cmd, "CONSOLE LOCK"))
+    {
+        console_relock();
+    }
+    else if (cmd_eq(cmd, "CONSOLE UNLOCK"))
+    {
+        uart_send_str("Already unlocked\r\n");
+    }
+    else if (cmd_prefix(cmd, "LINKTEST "))
+    {
+        const char *arg = cmd + 9;
+        if (cmd_eq(arg, "OFF"))
+        {
+            link_tx_clear_test();
+            uart_send_str("LinkTest OFF — live values resume\r\n");
+        }
+        else if (is_clean_u16(arg))
+        {
+            uint16 c = parse_u16(arg);
+            link_tx_set_test(c);
+            uart_send_str("LinkTest=0x");
+            uart_send_hex16(c);
+            uart_send_str(" — OVERRIDES live/fault codes; auto-expires in 5 min\r\n");
+            uart_send_str("(stream is suspended while unlocked: CONSOLE LOCK to transmit it)\r\n");
+        }
+        else
+        {
+            uart_send_str("ERR: LINKTEST <0-65535>|OFF\r\n");
+        }
     }
     else if (cmd_prefix(cmd, "THRESH "))
     {
@@ -539,55 +701,6 @@ static void process_cmd(const char *cmd)
             uart_send_str("ERR: rate 100-5000\r\n");
         }
     }
-    else if (cmd_prefix(cmd, "RANGE "))
-    {
-        const char *p = cmd + 6;
-        float lo, hi;
-        bool  ok;
-
-        /* Both operands must actually start numeric — parse_float reads
-         * garbage as 0.0, which would silently persist a wrong window.     */
-        while (*p == ' ') { p++; }
-        ok = ((*p >= '0' && *p <= '9') || *p == '.');
-        lo = parse_float(p);
-        /* step past the first number, then any spaces, to the second value */
-        while (*p == '-' || *p == '.' || (*p >= '0' && *p <= '9')) { p++; }
-        while (*p == ' ') { p++; }
-        ok = ok && ((*p >= '0' && *p <= '9') || *p == '.');
-        hi = parse_float(p);
-
-        /* Optional unit suffix: "RANGE <lo> <hi> PSI" converts both. Any
-         * other trailing text is rejected.                                 */
-        while (*p == '-' || *p == '.' || (*p >= '0' && *p <= '9')) { p++; }
-        while (*p == ' ') { p++; }
-        if (*p != '\0')
-        {
-            if (cmd_eq(p, "PSI")) { lo *= BAR_PER_PSI; hi *= BAR_PER_PSI; }
-            else                  { ok = false; }
-        }
-
-        if (ok && lo >= RANGE_BAR_FLOOR && hi <= RANGE_BAR_CEIL &&
-            (hi - lo) >= RANGE_MIN_SPAN_BAR)
-        {
-            nvm_config_set_range_bar(lo, hi);
-            if (nvm_config_save())
-            {
-                uart_send_str("Range=");
-                uart_send_float3(lo);
-                uart_send_str("-");
-                uart_send_float3(hi);
-                uart_send_str(" bar (saved)\r\n");
-            }
-            else
-            {
-                uart_send_str("Range set (NVM write failed)\r\n");
-            }
-        }
-        else
-        {
-            uart_send_str("ERR: RANGE <lo> <hi> [PSI]  (0<=lo<hi<=1000 bar)\r\n");
-        }
-    }
     else if (cmd_prefix(cmd, "PROBE "))
     {
         const char *arg = cmd + 6;
@@ -615,49 +728,6 @@ static void process_cmd(const char *cmd)
         else
         {
             uart_send_str("ERR: PROBE A|B|AVG\r\n");
-        }
-    }
-    else if (cmd_prefix(cmd, "OUTPUT "))
-    {
-        const char *arg = cmd + 7;
-        if (cmd_eq(arg, "AUTO"))
-        {
-            output_set_auto();
-            uart_send_str("Output AUTO\r\n");
-        }
-        else if (is_clean_u16(arg))            /* reject non/partial-numeric:
-                                                * "abc" parses as 0, "10O" as
-                                                * 10 — both would silently
-                                                * latch a wrong override     */
-        {
-            uint16 c = parse_u16(arg);
-            if (c <= 1023u)
-            {
-                output_set_manual(c);
-                if (fault_is_active())
-                {
-                    /* Fault has priority on the line — the manual value is
-                     * latched and takes effect once the fault clears.      */
-                    output_set_fault_low();
-                    uart_send_str("Output=");
-                    uart_send_u16(c);
-                    uart_send_str(" (latched; fault active, line stays fault-low)\r\n");
-                }
-                else
-                {
-                    uart_send_str("Output=");
-                    uart_send_u16(c);
-                    uart_send_str("\r\n");
-                }
-            }
-            else
-            {
-                uart_send_str("ERR: output 0-1023\r\n");
-            }
-        }
-        else
-        {
-            uart_send_str("ERR: OUTPUT <0-1023>|AUTO\r\n");
         }
     }
     else if (cmd_prefix(cmd, "CAL "))
@@ -761,7 +831,7 @@ static void process_cmd(const char *cmd)
                  * the operator waits forever for a "Captured" line.        */
                 uart_send_str("ERR: max 8 pts (STORE or ABORT)\r\n");
             }
-            else if (num_ok && (bar > 0.0f) && (bar <= RANGE_BAR_CEIL))
+            else if (num_ok && (bar > 0.0f) && (bar <= SENSOR_RATING_BAR))
             {
                 calibration_capture(bar);
                 uart_send_str("Capturing at ");
@@ -823,15 +893,15 @@ static void process_cmd(const char *cmd)
     else if (cmd_eq(cmd, "HELP"))
     {
         uart_send_str("Commands:\r\n");
-        uart_send_str("  STATUS          — probe counts + fault\r\n");
+        uart_send_str("  STATUS          — readings, link state, faults\r\n");
         uart_send_str("  RAW             — one burst: avg/min/max/mV/valid per ch\r\n");
         uart_send_str("  SCAN            — sweep all analog inputs (find live pin)\r\n");
         uart_send_str("  AUTO            — toggle auto-print\r\n");
         uart_send_str("  RATE <ms>       — set refresh rate (NVM)\r\n");
         uart_send_str("  THRESH <cnt>    — disagree threshold (NVM)\r\n");
-        uart_send_str("  RANGE <lo> <hi> — output window, bar (NVM)\r\n");
         uart_send_str("  PROBE A|B|AVG   — probe source (NVM)\r\n");
-        uart_send_str("  OUTPUT <n>/AUTO — manual output / resume\r\n");
+        uart_send_str("  LINKTEST <n>|OFF— force a 16-bit wire code (5 min)\r\n");
+        uart_send_str("  CONSOLE LOCK    — re-lock console, resume stream\r\n");
         uart_send_str("  POWER           — power consumption\r\n");
         uart_send_str("  CAL ARM         — start calibration\r\n");
         uart_send_str("  CAL <bar>       — capture at pressure (max 8 pts)\r\n");
@@ -844,14 +914,14 @@ static void process_cmd(const char *cmd)
         uart_send_str("  HELP            — this list\r\n");
     }
     /* Bare keywords: print the command's usage instead of "unknown". */
-    else if (cmd_eq(cmd, "RATE"))   { uart_send_str("ERR: RATE <100-5000 ms>\r\n"); }
-    else if (cmd_eq(cmd, "THRESH")) { uart_send_str("ERR: THRESH <1-4092>\r\n"); }
-    else if (cmd_eq(cmd, "RANGE"))  { uart_send_str("ERR: RANGE <lo> <hi> [PSI]  (0<=lo<hi<=1000 bar)\r\n"); }
-    else if (cmd_eq(cmd, "PROBE"))  { uart_send_str("ERR: PROBE A|B|AVG\r\n"); }
-    else if (cmd_eq(cmd, "OUTPUT")) { uart_send_str("ERR: OUTPUT <0-1023>|AUTO\r\n"); }
-    else if (cmd_eq(cmd, "CAL"))    { uart_send_str("ERR: CAL <bar>[ PSI]|ARM|STORE|CLEAR|STATUS|ABORT\r\n"); }
-    else if (cmd_eq(cmd, "PSI"))    { uart_send_str("ERR: PSI <value>\r\n"); }
-    else if (cmd_eq(cmd, "BAR"))    { uart_send_str("ERR: BAR <value>\r\n"); }
+    else if (cmd_eq(cmd, "RATE"))     { uart_send_str("ERR: RATE <100-5000 ms>\r\n"); }
+    else if (cmd_eq(cmd, "THRESH"))   { uart_send_str("ERR: THRESH <1-4092>\r\n"); }
+    else if (cmd_eq(cmd, "PROBE"))    { uart_send_str("ERR: PROBE A|B|AVG\r\n"); }
+    else if (cmd_eq(cmd, "LINKTEST")) { uart_send_str("ERR: LINKTEST <0-65535>|OFF\r\n"); }
+    else if (cmd_eq(cmd, "CONSOLE"))  { uart_send_str("ERR: CONSOLE LOCK|UNLOCK\r\n"); }
+    else if (cmd_eq(cmd, "CAL"))      { uart_send_str("ERR: CAL <bar>[ PSI]|ARM|STORE|CLEAR|STATUS|ABORT\r\n"); }
+    else if (cmd_eq(cmd, "PSI"))      { uart_send_str("ERR: PSI <value>\r\n"); }
+    else if (cmd_eq(cmd, "BAR"))      { uart_send_str("ERR: BAR <value>\r\n"); }
     else
     {
         uart_send_str("ERR: unknown '");
@@ -859,3 +929,5 @@ static void process_cmd(const char *cmd)
         uart_send_str("' (try HELP)\r\n");
     }
 }
+
+#endif /* LINK_CONSOLE_EN */

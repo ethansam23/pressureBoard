@@ -1,197 +1,246 @@
 # Pressure Transmitter — UART Command Reference
 
-Bench command set for the TLE9854QXW downhole pressure transmitter.
-_Source of truth: `app/uart_cmd.c` (`process_cmd`). Update this file when commands change._
+Bench command set for the TLE9854QXW downhole pressure transmitter (digital-link
+firmware). _Source of truth: `app/uart_cmd.c` (`process_cmd`). Update this file
+when commands change._
 
 ---
+
+## The shared line — read this first
+
+There is **one UART** (TX **P1.0** / RX **P1.1**, UART2, **9600 8N1**) and it is
+owned by the **downhole packet stream** (wire format: `link_protocol.md`). The
+console shares it under strict **mutual exclusion**:
+
+- **At power-on the console is LOCKED**: the firmware transmits *binary packets
+  only* — no banner, no text — and every command line is silently ignored.
+- Send exactly **`CONSOLE UNLOCK`** (+ Enter) to open a bench session. The
+  packet stream **suspends** (after the in-flight packet completes atomically)
+  and the console takes the line: banner + boot reset cause print, commands
+  work normally.
+- **`CONSOLE LOCK`**, **5 minutes of RX inactivity**, or a **power cycle**
+  re-locks: queued console output drains, the line goes idle for a full
+  inter-packet gap, then the packet stream resumes.
+- **Production builds (`LINK_CONSOLE_EN=0`) have no console at all** — parser
+  and console TX are compiled out; packets are the only possible bytes.
+  Pre-deployment check: send `CONSOLE UNLOCK`; silence = production build.
+
+While unlocked, the wire carries **no packets** — a connected logger sees the
+line go quiet (its staleness handling applies). The line carries either packets
+or text, never both interleaved.
 
 ## Connection
 
 | Setting | Value |
 |---|---|
-| Port | TX **P1.0** / RX **P1.1** (UART2) |
-| Baud | **115200**, 8N1 |
-| Line ending | **Enter** (`\r` or `\n`) submits the line; trailing spaces are trimmed |
-| Case | **Case-insensitive**, commands *and* arguments (`Rate 500`, `cal arm` work) |
-| Editing | Input is **echoed**; **Backspace** deletes the last char |
-| Boot banner | `== Pressure Transmitter v1 ==` (prints once on reset) |
-| Units | Firmware is **bar-native**; CAL/RANGE accept a `PSI` suffix, `PSI`/`BAR` convert |
+| Port | TX **P1.0** / RX **P1.1** (UART2) — same physical line as the logger |
+| Baud | **9600**, 8N1 |
+| Line ending | **Enter** (`\r` or `\n`) submits; trailing spaces trimmed |
+| Case | **Case-insensitive**, commands *and* arguments (`Rate 500`, `cal arm`) |
+| Editing | Echo + Backspace — **only while unlocked** (locked = totally silent) |
+| Unlock banner | `== Pressure Transmitter v2 (digital link) ==`, stream-suspended notice, boot reset cause (`RST 0x… WFS 0x…` + `[WDT1]/[POR]/[PIN]`), NVM-health warning if applicable |
+| Units | Firmware is **bar-native**; CAL accepts a `PSI` suffix; `PSI`/`BAR` convert |
 
-Unknown input returns: `ERR: unknown '<x>' (try HELP)`. A bare keyword
-(`RATE`, `CAL`, …) returns that command's usage string instead.
+Unknown input returns `ERR: unknown '<x>' (try HELP)`. A bare keyword
+(`RATE`, `CAL`, …) returns that command's usage string.
 
-**TEMP bring-up diagnostics** (will be removed once commissioning is done):
-each boot also prints `RST 0x<hex> WFS 0x<hex> : <cause flags>` (hardware
-reset cause — `PIN`/`POR`/`WDT1`/`LOCKUP`/…) and timestamped markers
-(`vddext t=`, `loop t=`, `wdt-svc t=`, `refresh t=`); every NVM save prints
+**TEMP diagnostics** (slated for removal): every NVM save prints
 `nvm: <cal|set> write... rc=<code>` (0 = success).
 
 ---
 
 ## Commands at a glance
 
+### Session
+| Command | Description |
+|---|---|
+| `CONSOLE UNLOCK` | Open a bench session (suspends the packet stream). The **only** line recognized while locked |
+| `CONSOLE LOCK` | End the session, resume the packet stream (also: 5-min inactivity, power cycle) |
+
 ### Readouts & diagnostics
 | Command | Description |
 |---|---|
-| `STATUS` | Live readings + settings (4 lines, see below) |
-| `RAW` | One fresh burst: `avg/min/max/mV/valid` per probe channel |
-| `SCAN` | Sweep all analog inputs (AN0/AN1/AN2/AN3/AN7) — `cnt` + `mV` |
-| `AUTO` | Toggle the **debug stream** (per-probe counts+mV, pressure, output V, drive state) each refresh |
+| `STATUS` | Live readings, link state, fault causes, settings (5 lines, below) |
+| `RAW` | One fresh burst: `avg/min/max/mV/valid` per probe channel — **native 10-bit** units (production pipeline counts are 4×) |
+| `SCAN` | Sweep all analog inputs (AN0/AN1/AN2/AN3/AN7) — `cnt` + `mV` (native 10-bit) |
+| `AUTO` | Toggle the debug stream (counts+mV per probe, pressure, pending link code + tag) each refresh. Cleared on re-lock |
 | `POWER` | Power readout (`40 mW`, placeholder until characterized) |
-| `PSI <x>` | Convert: prints `<x> psi = <y> bar` |
-| `BAR <x>` | Convert: prints `<x> bar = <y> psi` |
+| `PSI <x>` / `BAR <x>` | Unit converters |
 | `HELP` | On-device command list |
 
 ### Settings — persisted to NVM
 | Command | Range / values | Description |
 |---|---|---|
-| `RATE <ms>` | 100–5000 ms | Refresh / output update rate (out-of-range or non-numeric → `ERR: rate 100-5000`) |
-| `THRESH <cnt>` | 1–1023 counts | Probe-disagreement fault threshold (~thresh/8 hysteresis on clear) |
-| `RANGE <lo> <hi> [PSI]` | `0 ≤ lo < hi ≤ 1000` bar, span ≥ 1 | Output pressure window: `lo`→0.5 V, `hi`→4.5 V. `PSI` suffix converts both operands |
+| `RATE <ms>` | 100–5000 ms | Sample/refresh rate (the stream repeats the latest value at 25 pkt/s regardless) |
+| `THRESH <cnt>` | 1–4092 counts (12-bit-scaled) | Probe-disagreement threshold (~thresh/8 hysteresis on clear) |
 | `PROBE A\|B\|AVG` | `A`, `B`, `AVG` (or `DUAL`) | Probe source select |
 
-All numeric arguments are strictly validated — trailing garbage (`RATE 1000x`,
-`OUTPUT 10O`) is rejected instead of silently misparsed. Commands are processed
-at most **one per loop pass**, so a pasted batch executes sequentially.
+All numeric arguments are strictly validated — trailing garbage (`RATE 1000x`)
+is rejected. Commands run at most **one per loop pass**, so a pasted batch
+executes sequentially. NVM saves are additionally gated by the link fence — a
+failed fence reports `NVM write failed` and leaves stored settings untouched.
 
-### Output control
+### Link test
 | Command | Description |
 |---|---|
-| `OUTPUT <n>` | **Manual override** — pin output to raw count `n` (0–1023). **Latches** — ignores live pressure until cleared. |
-| `OUTPUT AUTO` | Clear override, resume live tracking |
+| `LINKTEST <n>` | Force 16-bit code `n` (0–65535) onto the wire — **overrides live values AND fault codes**. RAM-only, **auto-expires after 5 min**. The stream is suspended while unlocked, so: set the code, then `CONSOLE LOCK` to actually transmit it |
+| `LINKTEST OFF` | Return the wire to live values |
+
+`STATUS` shows `TEST(!)` while an override is active. **Never deploy with
+LINKTEST active** — the 5-min expiry and the power-cycle reset are backstops,
+not the plan.
 
 ### Calibration — values in **bar** (or append `PSI`)
 | Command | Description |
 |---|---|
 | `CAL ARM` | Start a calibration session |
-| `CAL <bar>` | Capture a point at the given reference pressure (must be armed; `0 < bar ≤ 1000`; **max 8 points** — at the cap: `ERR: max 8 pts (STORE or ABORT)`) |
-| `CAL <x> PSI` | Same, but the value is in **psi** (converted at the parser; echo shows both units) |
-| `CAL STORE` | Compute least-squares fit + save to NVM. Distinct errors: `ERR: need >=2 pts`, `ERR: degenerate fit (points at same counts)`, `ERR: NVM write failed` |
-| `CAL STATUS` | Show `VALID/NONE`, point count, slope, offset (points persist across power cycles) |
-| `CAL CLEAR` | Erase the stored calibration (on erase failure: `Cal cleared (RAM only - ...)`) |
+| `CAL <bar>` | Capture a point at the reference pressure (armed; `0 < bar ≤ 1000`; **max 8 points**) |
+| `CAL <x> PSI` | Same, value in **psi** (converted at the parser; echo shows both) |
+| `CAL STORE` | Least-squares fit + save to NVM. Distinct errors: `ERR: need >=2 pts`, `ERR: degenerate fit…`, `ERR: NVM write failed` |
+| `CAL STATUS` | `VALID/NONE`, point count, slope, offset (points persist across power cycles) |
+| `CAL CLEAR` | Erase stored calibration (on erase failure: `Cal cleared (RAM only - …)`) |
 | `CAL ABORT` | Abort the current session |
 
 **Timing:** each capture averages `8 × RATE` ms of readings (8 s at the default
 1000 ms — set `RATE 100` during bench cal for ~0.8 s captures, restore after).
-`CAL STORE` itself takes ~10 ms; the 2 s solid LED afterward is the *stored*
-indicator, not store-in-progress. While **capturing**, `CAL ARM`/`CAL STORE`/
-another `CAL <bar>` are rejected (`ERR: capture in progress…`) so the in-flight
-point can't be silently dropped — and capture **pauses while any fault is
+While **capturing**, `CAL ARM`/`CAL STORE`/another `CAL <bar>` are rejected so
+the in-flight point can't be dropped — and capture **pauses while any fault is
 active** so a corrupted reading can't enter a cal point.
 
 ---
 
 ## Output formats
 
-**`STATUS`** — four lines:
+**`STATUS`** — five lines:
 ```
-ProbeA: <a>  ProbeB: <b>  Avg: <c>  Probe: <A|B|AVG>
-Output: <V>V  <AUTO|MANUAL>  Fault: <YES|no>
-Rate: <ms>ms  Thresh: <t>  Range: <lo>-<hi> bar
-Cal: <NONE | VALID  slope=<f> offset=<f>>
+ProbeA: 2048  ProbeB: 2052  Avg: 2050  Probe: AVG
+Link: 0x04D2  LIVE  mode=CONSOLE (stream suspended)  pkts=12345 aborts=0 skips=0
+Faults: none
+Rate: 1000ms  Thresh: 80  NVM: ok
+Cal: VALID  slope=0.245 offset=-1.013
 ```
+- `Link:` the 16-bit code on (or pending for) the wire; `LIVE` or `TEST(!)`
+- `mode=` `PKT` (streaming) or `CONSOLE (stream suspended)`
+- `Faults:` **all** active causes (`ADC_STALL` / `VDDEXT` / `DISAGREE`) — the
+  wire carries only the highest-priority one
+- `pkts/aborts/skips`: packets sent, aborts (any origin), busy-skips
 
-**`AUTO`** — one line per refresh (`FLT`/`MAN`/`CAL`/`RAW` = which path drives the output):
+**`AUTO`** — one line per refresh; tag = `TST`/`FLT`/`CAL`/`UNC`:
 ```
-A:<cnt> <mV>mV  B:<cnt> <mV>mV  Avg:<cnt>  P:<bar>bar  Out:<V>V <state>
+A:2048 2500mV  B:2052 2505mV  Avg:2050  P:123.400bar  Link:0x04D2 CAL
 ```
-`P:` shows `uncal` until a calibration is stored. `Out:` is the *actual* commanded output voltage.
+`P:` shows `uncal` until a calibration is stored. Counts are 12-bit-scaled
+(0–4092).
 
-**`RAW`** (1 LSB ≈ 5 mV on the attenuated P2.x inputs):
+**`RAW`** (native 10-bit; 1 LSB ≈ 5 mV on the attenuated P2.x inputs):
 ```
-RAW (P2.x inputs, 1 LSB ~5mV):
+RAW (native 10-bit, 1 LSB ~5mV; production counts = 4x):
   A: avg=<> min=<> max=<> mV=<> valid=<>/16
   B: avg=<> min=<> max=<> mV=<> valid=<>/16
 ```
 
-**`SCAN`** (`<-` marks the channels the firmware uses):
-```
-SCAN all analog inputs (<- = used by firmware):
-  AN0(P2.0)    cnt=<> mV=<>
-  AN1(P2.1)    cnt=<> mV=<>
-  AN2(P2.2)    cnt=<> mV=<>
-  AN3(P2.3) <-B cnt=<> mV=<>
-  AN7(P2.7) <-A cnt=<> mV=<>
-```
+**`SCAN`** — unchanged (`<-` marks the channels the firmware uses).
 
-**`CAL STATUS`**:
-```
-Cal: <VALID|NONE>  pts=<n>  slope=<f>  offset=<f>     (slope/offset only when VALID)
-```
-
-Settings echo `... (saved)` on NVM-write success, or `(NVM write failed)`.
+Settings echo `… (saved)` on NVM-write success, or `(NVM write failed)`.
 
 ---
 
-## Output behavior (how the voltage is computed)
+## Wire behavior (how the link code is computed)
 
-The output is a PWM-DAC on **P0.1** → op-amp filter → 0.5–4.5 V analog line (fault bands below/above).
+The downhole interface is a one-way 9600-baud packet stream on P1.0 (full
+spec: `link_protocol.md`). Each packet carries one 16-bit code, selected in
+**priority order** every refresh:
 
-In **priority order** (higher rows override lower ones):
-
-| Condition | Output |
+| Condition | Code |
 |---|---|
-| **Any fault active** (probe disagreement, VDDEXT/excitation unstable, or ADC stalled) | **Fault-low ≈ 0.25 V** — overrides everything, including manual (`OUTPUT <n>` during a fault latches and answers `(latched; fault active...)`) |
-| Manual override (`OUTPUT <n>`) | Fixed at `0.5 + (n/1023)×4.0` V (re-asserts itself after a fault clears) |
-| Calibrated (cal valid) | `0.5 + (bar − range_lo)/(range_hi − range_lo) × 4.0` V (keeps driving even while a new cal session is armed) |
-| Uncalibrated | `0.5 + (Avg / 1023) × 4.0` V (raw counts) |
+| `LINKTEST` active | the forced code (overrides everything) |
+| ADC stalled | `0xFF04` ADC_STALL |
+| VDDEXT unstable | `0xFF05` VDDEXT |
+| Probe disagreement | `0xFF03` DISAGREE |
+| Calibrated | pressure, 0.1 bar/LSB (`0`–`10000`); >1010 bar → `0xFF06` OVER_RANGE, <−5 bar → `0xFF07` UNDER_RANGE |
+| Uncalibrated | `0xFF02` UNCAL — **never raw counts dressed as pressure** |
 
-`Avg` is the probe source selected by `PROBE` (A only, B only, or the average).
-
-**Boot fail-safe:** from reset until the first completed reading (~1 refresh
-period), the line is held at **fault-low ≈ 0.25 V** so the battery can't
-mistake a not-yet-measured boot value for a real ambient pressure.
+**Boot fail-safe:** the stream starts within milliseconds of power-on carrying
+`0xFF01` NO_READING until the first refresh completes — the wire never shows a
+fake pressure, and a silent line means a dead tool (logger staleness handling).
 
 ---
 
 ## Common workflows
 
+**Open a session / close it:**
+```
+CONSOLE UNLOCK    → banner; stream suspended
+...work...
+CONSOLE LOCK      → stream resumes (or just walk away: 5-min auto-relock)
+```
+
 **Single-probe board (probe on AN7):**
 ```
-PROBE A          → output follows ProbeA; averaging + disagreement fault disabled
-STATUS           → confirm "Probe: A"
+PROBE A           → readings follow ProbeA; disagreement fault disabled
+STATUS            → confirm "Probe: A"
 ```
 
-**Set the operating window (better resolution):**
+**Calibrate (psi gauge on the bench):**
 ```
-RANGE 0 600      → map 0–600 bar onto 0.5–4.5 V  (≈0.73 bar/step vs 1.2 at full 1000 bar)
-```
-
-**Calibrate (multi-point; psi gauge on the bench):**
-```
-RATE 100         → fast captures (~0.8 s each) for the bench session
+RATE 100          → fast captures (~0.8 s each)
 CAL ARM
-CAL 14.7 PSI     → capture at ambient ("Capturing at 1.013 bar (14.700 psi)...")
-CAL 7250 PSI     → capture at 500 bar reference
-CAL STORE        → "Cal stored: slope=.. offset=.."
-CAL STATUS       → verify VALID
-RATE 1000        → restore the operating rate
+CAL 14.7 PSI      → capture at ambient
+CAL 7250 PSI      → capture at 500 bar reference
+CAL STORE         → "Cal stored: slope=.. offset=.."
+RATE 1000         → restore operating rate
+CONSOLE LOCK      → resume stream; watch decoded pressure in the monitor
 ```
 
-**Test the output stage independent of the sensor:**
+**Test the link end-to-end (independent of the sensor):**
 ```
-OUTPUT 0         → expect ~0.50 V (~10% duty)
-OUTPUT 512       → expect ~2.50 V (~50% duty)
-OUTPUT 1023      → expect ~4.50 V (~90% duty)
-OUTPUT AUTO      → resume live  (IMPORTANT: forgetting this pins the output)
+LINKTEST 10000    → full scale: expect 7F .. 27 10 C8 on the wire
+CONSOLE LOCK      → stream transmits the forced code
+(scope/monitor)   → verify
+CONSOLE UNLOCK
+LINKTEST OFF      → back to live
 ```
 
 ---
 
 ## Quirks & gotchas
 
-- **`OUTPUT <n>` latches.** It stays pinned (a stuck `OUTPUT 1023` reads as a constant ~90% duty) until `OUTPUT AUTO`. `STATUS` now shows `MANUAL` vs `AUTO` so you can spot it, and the `AUTO` stream tags it `MAN`. A fault temporarily forces fault-low; the manual value re-asserts when the fault clears.
-- **`Fault: YES` covers two sources:** probe disagreement *and* excitation (VDDEXT) instability. The VDDEXT check runs every refresh and auto-recovers; while it's down you'll also have seen `WARN: VDDEXT not stable (excitation down)` at boot.
-- **Re-calibrate after the bar firmware.** The calibration NVM magic was bumped (cal is now stored in bar), so any pre-bar calibration is rejected — `CAL STATUS` will read `NONE` until you re-cal.
-- **Settings survive power cycles** (`RATE`/`THRESH`/`RANGE`/`PROBE`); the calibration is separate NVM. Captured cal points are reloaded too, so `CAL STATUS` shows the real `pts=` count after a reboot.
-- **`RANGE` only affects the calibrated output path.** Uncalibrated output maps raw counts 0–1023 directly to 0.5–4.5 V regardless of `RANGE`.
-- **Commands and arguments are both case-insensitive** (`Rate 500`, `cal arm`, `output Auto` all work).
-- If boot prints `WARN: NVM data flash inconsistent (saves disabled)`, the data-flash mapping failed its startup check — all NVM saves return `(NVM write failed)` / `ERR: NVM write failed` until the data sector is recovered (full chip erase + reflash).
+- **Everything is silent until `CONSOLE UNLOCK`.** A board that "prints
+  nothing at boot" is CORRECT — watch the binary stream instead (host monitor
+  or scope). If `CONSOLE UNLOCK` also gets no reply, you have a production
+  build (or the wrong baud — it's 9600 now, not 115200).
+- **Unlocking stops the stream.** A logger connected during a bench session
+  records its staleness/no-data behavior for that period. That's by design —
+  text and packets never share the wire.
+- **`LINKTEST` latches (5-min cap).** `STATUS` shows `TEST(!)`; `AUTO` tags
+  `TST`. It overrides fault codes too — that's the point (it tests the link),
+  and why it expires.
+- **Re-calibrate + re-enter settings after flashing this firmware.** Both NVM
+  magics were bumped (12-bit count scale; window field removed): old cal and
+  old settings are intentionally rejected. Wire shows `0xFF02` until re-cal.
+- **`Faults:` in STATUS lists every active cause; the wire shows one** (the
+  highest priority). A VDDEXT fault can hide a simultaneous disagreement on
+  the wire — STATUS is the full picture.
+- **RAW/SCAN are native 10-bit; the production pipeline is 4× those counts.**
+  A RAW avg of 512 corresponds to Avg≈2048 in STATUS/AUTO.
+- If the unlock banner includes `WARN: NVM data flash inconsistent`, all NVM
+  saves will fail until the data sector is recovered (full erase + reflash).
 
 ---
 
 ## Changelog
 
+- **2026-07-14: DIGITAL LINK REARCHITECTURE.** Analog PWM-DAC output (P0.1)
+  removed entirely; the downhole interface is now a one-way 9600-baud packet
+  stream on P1.0 (see `link_protocol.md`). Console moved to the same line at
+  9600 under mutual exclusion: boots LOCKED, `CONSOLE UNLOCK`/`CONSOLE LOCK`
+  added, 5-min inactivity auto-relock, banner moved to unlock (boot is
+  packets-only). Removed: `OUTPUT` (→ `LINKTEST <n>|OFF`, auto-expiring),
+  `RANGE` (wire scale is fixed absolute 0–1000 bar). STATUS/AUTO reformatted
+  (link code, mode, packet counters, per-cause fault list, NVM health).
+  Counts are 12-bit-scaled (THRESH 1–4092; RAW/SCAN stay native 10-bit).
+  Both NVM magics bumped — settings + calibration reset on first boot.
+  Fault causes split (ADC_STALL / VDDEXT / DISAGREE) and reported as distinct
+  wire codes. NVM writes fenced to wire-idle windows (fail-closed).
 - **2026-06-10:** PSI front end — `CAL <x> PSI`, `RANGE <lo> <hi> PSI`, and `PSI <x>`/`BAR <x>` converters (firmware stays bar-native). Round-2 verified fixes: removed the double WDT1 window-count (the standalone boot-reset loop); NVM saves are now a single mapped-page write (power-fail-safe, no pre-erase) with `nvm: … rc=` diagnostics; fault also raised on ADC stall; VDDEXT supervision re-enables a latched-off regulator; ~thresh/8 fault hysteresis; capture pauses during faults and CAL ARM/STORE/<bar> are rejected mid-capture; CAL CLEAR reports erase failure honestly; failed STORE keeps the previous fit live; strict numeric parsing everywhere; one command per loop pass; bare keywords print usage; trailing spaces trimmed; TEMP boot/reset-cause diagnostics added.
 - **2026-06-09:** fix batch from the doc-vs-firmware audit — RATE now rejects out-of-range (`ERR: rate 100-5000`) instead of persisting an unclamped value; arguments case-insensitive (`Rate 500` works); `OUTPUT` rejects non-numeric args; CAL STORE errors are now distinct (need >=2 pts / degenerate fit / NVM write failed); `CAL <bar>` at the 8-point cap errors instead of silently doing nothing; CAL ABORT added to on-device HELP; cal points persist across power cycles; boot output is fault-low until the first reading; fault (incl. new VDDEXT supervision) overrides manual; TX buffer 1024 B (HELP no longer truncates).
-- _(add dated entries here as commands change — e.g. "2026-06-07: added PROBE, RANGE; CAL now in bar")_

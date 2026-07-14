@@ -1,30 +1,28 @@
 #include "nvm_config.h"
 #include "app_config.h"
 #include "uart_cmd.h"      /* TEMP: nvm diagnostics (rc prints) — remove with them */
+#include "link_tx.h"       /* NVM fence: flash ops only in wire-idle windows  */
 #include "bootrom.h"
 #include "wdt1.h"
 #include "tle985x.h"
 #include "sfr_access.h"
 
-#define SETTINGS_MAGIC  0x53455403u   /* "SET\x03" (v3: counts are 12-bit-scaled;
-                                       * a stored 10-bit disagree threshold would
-                                       * be 4x too tight -> force defaults)      */
+#define SETTINGS_MAGIC  0x53455404u   /* "SET\x04" (v4: 12-bit-scaled counts —
+                                       * a stored 10-bit threshold would be 4x
+                                       * too tight; pressure window removed
+                                       * with the analog output)                 */
 
 typedef struct {
     uint32_t magic;
     uint32_t rate_ms;
     uint16_t disagree_thresh;
     uint16_t probe_mode;        /* was 'reserved' (0 = DUAL, so back-compat)  */
-    float    range_lo_bar;
-    float    range_hi_bar;
 } settings_nvm_t;
 
 /* ---- RAM copy ----------------------------------------------------------- */
 static uint32 rate_ms;
 static uint16 disagree_thresh;
 static uint16 probe_mode;
-static float  range_lo_bar;
-static float  range_hi_bar;
 static bool   flash_healthy;
 
 /* ========================================================================= */
@@ -46,8 +44,6 @@ void nvm_config_init(void)
         rate_ms         = nvm->rate_ms;
         disagree_thresh = nvm->disagree_thresh;
         probe_mode      = nvm->probe_mode;
-        range_lo_bar    = nvm->range_lo_bar;
-        range_hi_bar    = nvm->range_hi_bar;
 
         /* Clamp to valid range */
         if (rate_ms < REFRESH_RATE_MIN_MS || rate_ms > REFRESH_RATE_MAX_MS)
@@ -62,22 +58,12 @@ void nvm_config_init(void)
         {
             probe_mode = PROBE_MODE_DEFAULT;
         }
-        /* NaN/garbage from an unwritten field fails these compares -> default */
-        if (!(range_lo_bar >= RANGE_BAR_FLOOR &&
-              range_hi_bar <= RANGE_BAR_CEIL &&
-              (range_hi_bar - range_lo_bar) >= RANGE_MIN_SPAN_BAR))
-        {
-            range_lo_bar = RANGE_LO_BAR_DEFAULT;
-            range_hi_bar = RANGE_HI_BAR_DEFAULT;
-        }
     }
     else
     {
         rate_ms         = REFRESH_RATE_DEFAULT_MS;
         disagree_thresh = PROBE_DISAGREE_DEFAULT;
         probe_mode      = PROBE_MODE_DEFAULT;
-        range_lo_bar    = RANGE_LO_BAR_DEFAULT;
-        range_hi_bar    = RANGE_HI_BAR_DEFAULT;
     }
 }
 
@@ -101,8 +87,6 @@ bool nvm_config_save(void)
     d->rate_ms         = rate_ms;
     d->disagree_thresh = disagree_thresh;
     d->probe_mode      = probe_mode;
-    d->range_lo_bar    = range_lo_bar;
-    d->range_hi_bar    = range_hi_bar;
 
     /* SINGLE mapped-region write, no pre-erase (see calibration.c
      * save_to_nvm for the full rationale): the BootROM's used-page write
@@ -113,11 +97,17 @@ bool nvm_config_save(void)
      * the SOW window (no SysTick needed to service it).                     */
     uart_send_str("nvm: set write... ");       /* TEMP diag */
     uart_tx_flush_bounded();                   /* TEMP diag */
+    /* FENCE (fail-closed): the ~5-10 ms IRQ-masked flash stall may only run
+     * in a wire-idle window — never mid-packet. On failure, SKIP the write
+     * and report it; the RAM settings are preserved.                        */
+    if (!link_tx_fence_bounded()) { return false; }
     WDT1_SOW_Service(1u);
     __disable_irq();
     rc = user_nvm_write(SETTINGS_NVM_ADDR, page, (uint32_t)FlashPageSize, 0u);
     __enable_irq();
     (void)WDT1_Service();
+    link_tx_release();                         /* transmits nothing; next
+                                                * packet per overdue policy  */
     uart_send_str("rc=");                      /* TEMP diag */
     uart_send_i32(rc);
     uart_send_str("\r\n");
@@ -130,10 +120,6 @@ void   nvm_config_set_rate_ms(uint32 ms)   { rate_ms = ms; }
 
 uint16 nvm_config_get_disagree_thresh(void)     { return disagree_thresh; }
 void   nvm_config_set_disagree_thresh(uint16 t) { disagree_thresh = t; }
-
-float  nvm_config_get_range_lo_bar(void)            { return range_lo_bar; }
-float  nvm_config_get_range_hi_bar(void)            { return range_hi_bar; }
-void   nvm_config_set_range_bar(float lo, float hi) { range_lo_bar = lo; range_hi_bar = hi; }
 
 uint16 nvm_config_get_probe_mode(void)              { return probe_mode; }
 void   nvm_config_set_probe_mode(uint16 m)          { probe_mode = m; }

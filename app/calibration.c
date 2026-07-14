@@ -2,6 +2,7 @@
 #include "status_led.h"
 #include "nvm_config.h"
 #include "uart_cmd.h"      /* TEMP: nvm diagnostics (rc prints) — remove with them */
+#include "link_tx.h"       /* NVM fence: flash ops only in wire-idle windows  */
 #include "bootrom.h"
 #include "wdt1.h"
 
@@ -142,11 +143,14 @@ bool calibration_clear(void)
 
         uart_send_str("nvm: cal erase... ");   /* TEMP diag */
         uart_tx_flush_bounded();               /* TEMP diag */
+        /* FENCE (fail-closed): flash stalls only in wire-idle windows.      */
+        if (!link_tx_fence_bounded()) { return false; }
         WDT1_SOW_Service(1u);
         __disable_irq();             /* atomic NVM op -- see save_to_nvm()      */
         rc = user_nvm_page_erase(CAL_NVM_ADDR);
         __enable_irq();
         (void)WDT1_Service();
+        link_tx_release();
         uart_send_str("rc=");                  /* TEMP diag */
         uart_send_i32(rc);
         uart_send_str("\r\n");
@@ -235,11 +239,16 @@ static bool save_to_nvm(void)
      * fetch mid-op locks up the core.                                       */
     uart_send_str("nvm: cal write... ");       /* TEMP diag */
     uart_tx_flush_bounded();                   /* TEMP diag */
+    /* FENCE (fail-closed): the ~5-10 ms IRQ-masked flash stall may only run
+     * in a wire-idle window — on failure skip the write (reported as
+     * CAL_STORE_NVM_FAIL); the captured points and RAM cal are preserved.   */
+    if (!link_tx_fence_bounded()) { return false; }
     WDT1_SOW_Service(1u);
     __disable_irq();
     rc = user_nvm_write(CAL_NVM_ADDR, page, (uint32_t)FlashPageSize, 0u);
     __enable_irq();
     (void)WDT1_Service();
+    link_tx_release();
     uart_send_str("rc=");                      /* TEMP diag */
     uart_send_i32(rc);
     uart_send_str("\r\n");

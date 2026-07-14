@@ -5,8 +5,9 @@
 
 /*******************************************************************************
  * Persistent settings — NVM page at SETTINGS_NVM_ADDR.
- * Stores refresh rate, probe-disagree threshold, and the output pressure
- * window (range_lo/range_hi, in bar).
+ * Stores refresh rate, probe-disagree threshold, and probe mode.
+ * (The analog-output pressure window was removed with the PWM output — the
+ * digital link encodes a fixed absolute 0-1000 bar scale.)
  ******************************************************************************/
 
 void   nvm_config_init(void);    /* load from NVM (or defaults)              */
@@ -23,11 +24,6 @@ void   nvm_config_set_rate_ms(uint32 ms);
 
 uint16 nvm_config_get_disagree_thresh(void);
 void   nvm_config_set_disagree_thresh(uint16 t);
-
-/* Output pressure window (bar): range_lo→0.5V, range_hi→4.5V */
-float  nvm_config_get_range_lo_bar(void);
-float  nvm_config_get_range_hi_bar(void);
-void   nvm_config_set_range_bar(float lo, float hi);
 
 /* Probe source: PROBE_MODE_DUAL / _A / _B */
 uint16 nvm_config_get_probe_mode(void);

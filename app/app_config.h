@@ -15,11 +15,12 @@
 #define ADC_CH_PROBE_A          12u     /* ADC1_CH12 = P2.7 (package AN7)     */
 #define ADC_CH_PROBE_B          9u      /* ADC1_CH9  = P2.3 (package AN3)     */
 
-/* PWM output */
-/* P0.1 — CCU6 CC62 output (alt 2), configured at runtime by output module   */
-
-/* UART bench port */
-/* TX P1.0 (alt 3) / RX P1.1 — UART2, NVIC IRQ 11; pins set up in uart_cmd_init */
+/* Downhole link + bench console — ONE shared UART:
+ * TX P1.0 (alt 3) / RX P1.1 — UART2, NVIC IRQ 11, 9600 8N1. Base setup in
+ * link_tx_init (the link OWNS UART2); the debug console adds RX on top.
+ * P1.0 is push-pull when driven and HIGH-Z during MCU reset — the harness
+ * must provide the idle-high pull (see link_protocol.md).
+ * P0.1 (old PWM) and P0.2/UART1 (SWD debug strap) are deliberately unused.  */
 
 /* v2 sync line — GPIO reserved, pin TBD                                     */
 
@@ -49,12 +50,20 @@
                                          * must stay well under the ~300 ms
                                          * WDT1 service budget               */
 
-/* ---- Output voltage mapping (TODO: confirm with battery team) ----------- */
-#define OUT_V_SUPPLY            5.0f    /* op-amp supply rail, volts           */
-#define OUT_V_LO                0.5f    /* pressure-low  voltage              */
-#define OUT_V_HI                4.5f    /* pressure-high voltage              */
-#define FAULT_V_LO              0.25f   /* fault-low  band (≤ this)           */
-#define FAULT_V_HI              4.75f   /* fault-high band (≥ this)           */
+/* ---- Downhole link (wire protocol constants live in link_frame.h) ------- */
+#ifndef LINK_CONSOLE_EN                 /* overridable from the Keil target    */
+#define LINK_CONSOLE_EN         1       /* 1 = debug build: bench console
+                                         * compiled in (boots LOCKED, unlock
+                                         * suspends the stream). 0 = PRODUCTION:
+                                         * console compiled out entirely —
+                                         * packets are the only possible
+                                         * bytes on the wire. Set via a -D
+                                         * define in the production target.   */
+#endif
+#define LINK_FENCE_TIMEOUT_MS   15u     /* fence: max wait for a safe idle
+                                         * window (packet worst case 9.2 ms)  */
+#define LINK_CONSOLE_RELOCK_MS  300000u /* 5 min RX inactivity -> auto-relock */
+#define LINKTEST_EXPIRY_MS      300000u /* forced test code auto-expiry       */
 
 /* ---- Unit conversion ----------------------------------------------------- *
  * Firmware is bar-native; the bench gauge reads psi. UART accepts a "PSI"
@@ -62,33 +71,17 @@
 #define BAR_PER_PSI             0.0689476f
 #define PSI_PER_BAR             14.5038f
 
-/* ---- Pressure range (bar, runtime-adjustable) --------------------------- *
- * Units are BAR throughout. The sensor is rated 1000 bar, but the OUTPUT maps
- * the tool's *operating* window [range_lo, range_hi] onto the 0.5-4.5 V
- * sub-range -- so set range_hi to the max the tool will actually see (not the
- * sensor rating) to spend the 10 output bits where it matters. The window is
- * UART-settable (RANGE cmd) + NVM-persisted; these are the power-on defaults.
- * Sensor sensitivity ~0.16 mV/bar is nominal/uncertain -- the multi-point
- * calibration absorbs the real transfer function, so nothing here relies on it.
- * NOTE: 10-bit over the window = span/819 per step (e.g. 0-600 bar -> ~0.73
- * bar/step). ±1-2 bar is realistic at 10-bit; tighter needs 12-bit PWM.        */
-#define RANGE_LO_BAR_DEFAULT    1.0f        /* maps to OUT_V_LO (0.5 V); ambient ~1.013 bar */
-#define RANGE_HI_BAR_DEFAULT    1000.0f     /* maps to OUT_V_HI (4.5 V); lower to tool max  */
-#define RANGE_BAR_FLOOR         0.0f        /* validation: lo >= this               */
-#define RANGE_BAR_CEIL          1000.0f     /* validation: hi <= sensor rating       */
-#define RANGE_MIN_SPAN_BAR      1.0f        /* validation: hi - lo >= this           */
+/* ---- Sensor rating -------------------------------------------------------
+ * Fixed absolute scale: the wire protocol encodes 0-1000.0 bar in deci-bar
+ * (see link_frame.h). The old runtime RANGE window existed only to scale the
+ * analog output and was deleted with it. Sensor sensitivity ~0.16 mV/bar is
+ * nominal — the amplified front end + multi-point calibration absorb the
+ * real transfer function.                                                   */
+#define SENSOR_RATING_BAR       1000.0f     /* CAL capture validation ceiling */
 
-/* ---- PWM DAC (TODO: finalize after hardware filter) --------------------- *
- * NOTE: the actual frequency is set by output_init(): fCCU6/2 = 20 MHz over
- * a 1024-step period = 19.531 kHz. PWM_FREQ_HZ is INFORMATIONAL ONLY --
- * changing it does not reprogram the timer (revisit when the hardware
- * filter values land and the divider is worth deriving).                    */
-#define PWM_FREQ_HZ             19531u  /* actual: 20 MHz / 1024 (see note)   */
-#define PWM_RESOLUTION_BITS     10u     /* match ADC effective bits           */
-#define PWM_MAX_COUNT           (1u << PWM_RESOLUTION_BITS)
-
-/* ---- UART --------------------------------------------------------------- */
-#define UART_BAUD               115200u
+/* ---- UART ----------------------------------------------------------------
+ * 9600 8N1 — the LOGGER's rate; the shared console runs at it too.          */
+#define UART_BAUD               9600u
 #define UART_TX_BUF_SIZE        1024u   /* ISR TX ring buffer — must hold the
                                          * largest single burst (HELP ~800 B);
                                          * uart_putc DROPS bytes when full     */

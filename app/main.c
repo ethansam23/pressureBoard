@@ -3,52 +3,14 @@
 #include "scheduler.h"
 #include "status_led.h"
 #include "acquisition.h"
-#include "output.h"
+#include "link_frame.h"
+#include "link_tx.h"
 #include "calibration.h"
 #include "fault.h"
 #include "nvm_config.h"
 #include "uart_cmd.h"
 
 static acq_result_t acq;
-
-/* ===== TEMP standalone bring-up diagnostics — remove once the power-cycle
- * reset loop is solved. Prints the hardware reset cause + timestamped
- * progress markers so a UART capture shows where each boot dies.           */
-static void diag_print_reset_cause(void)
-{
-    uint32 rst = PMU->RESET_STS.reg;
-    uint32 wfs = PMU->WFS.reg;
-
-    uart_send_str("RST 0x");
-    uart_send_hex16((uint16)rst);
-    uart_send_str(" WFS 0x");
-    uart_send_hex16((uint16)wfs);
-    uart_send_str(" :");
-    if ((rst & PMU_RESET_STS_PMU_VS_POR_Msk) != 0u) { uart_send_str(" POR");     }
-    if ((rst & PMU_RESET_STS_PMU_PIN_Msk)    != 0u) { uart_send_str(" PIN");     }
-    if ((rst & PMU_RESET_STS_PMU_ExtWDT_Msk) != 0u) { uart_send_str(" WDT1");    }
-    if ((rst & PMU_RESET_STS_PMU_IntWDT_Msk) != 0u) { uart_send_str(" IntWDT");  }
-    if ((rst & PMU_RESET_STS_PMU_ClkWDT_Msk) != 0u) { uart_send_str(" ClkWDT");  }
-    if ((rst & PMU_RESET_STS_PMU_SOFT_Msk)   != 0u) { uart_send_str(" SOFT");    }
-    if ((rst & PMU_RESET_STS_LOCKUP_Msk)     != 0u) { uart_send_str(" LOCKUP");  }
-    if ((rst & PMU_RESET_STS_SYS_FAIL_Msk)   != 0u) { uart_send_str(" SYSFAIL"); }
-    if ((rst & PMU_RESET_STS_PMU_LPR_Msk)    != 0u) { uart_send_str(" LPR");     }
-    if ((rst & (PMU_RESET_STS_PMU_WAKE_Msk |
-                PMU_RESET_STS_PMU_SleepEX_Msk)) != 0u) { uart_send_str(" WAKE"); }
-    if ((wfs & PMU_WFS_WDT1_SEQ_FAIL_Msk)    != 0u) { uart_send_str(" [WDT1_SEQ_FAIL]"); }
-    uart_send_str("\r\n");
-
-    PMU->RESET_STS.reg = 0u;   /* clear-if-RW so each boot reports fresh     */
-}
-
-static void diag_mark(const char *tag)
-{
-    uart_send_str(tag);
-    uart_send_str(" t=");
-    uart_send_u16((uint16)scheduler_get_ms());
-    uart_send_str("\r\n");
-}
-/* ===== end TEMP diagnostics ============================================== */
 
 /* VDDEXT_CTRL.STABLE without the enable+200 µs delay of PMU_VDDEXT_On() —
  * used for the per-refresh excitation supervision. */
@@ -101,139 +63,154 @@ int main(void)
 
     status_led_init();
     acquisition_init();
-    output_init();              /* boots in the fault-low band (fail-safe)    */
+    link_tx_init();             /* owns UART2; the packet stream is alive from
+                                 * here, carrying NO_READING (boot fail-safe:
+                                 * the wire never shows a fake pressure)      */
     calibration_init();
     fault_init();
-    uart_cmd_init();
+    uart_cmd_init();            /* debug builds: console RX, BOOTS LOCKED —
+                                 * zero TX text until CONSOLE UNLOCK          */
 
-    diag_print_reset_cause();          /* TEMP bring-up diagnostic           */
-
-    if (!nvm_flash_is_healthy())
-    {
-        uart_send_str("WARN: NVM data flash inconsistent (saves disabled)\r\n");
-    }
+    /* Reset cause: captured for the console unlock banner (nothing may
+     * print at boot — the wire carries packets only), then cleared so the
+     * next boot reports fresh.                                              */
+    uart_cmd_set_boot_info(PMU->RESET_STS.reg, PMU->WFS.reg);
+    PMU->RESET_STS.reg = 0u;
 
     /* ---- Enable VDDEXT; BOUNDED wait for it to stabilize ---------------- *
      * Never spin here forever. VDDEXT can latch off (undervoltage/overtemp),
      * and a warm NRST may not clear that latch -> an unbounded wait would
      * hang on every reset with the rail down. Time-box it; on timeout latch
-     * a system fault so the analog line signals out-of-band (fault-low) —
-     * UART and LED are bench-only and invisible downhole.                   */
+     * the VDDEXT fault so the wire carries its code — LED and console are
+     * bench-only and invisible downhole. The link is serviced THROUGHOUT
+     * the wait so the stream starts on schedule.                            */
     {
         uint32 vddext_t0 = scheduler_get_ms();
         while (PMU_VDDEXT_On() == false)
         {
             (void)WDT1_Service();
+            link_tx_service();
             if ((scheduler_get_ms() - vddext_t0) >= VDDEXT_SETTLE_TIMEOUT_MS)
             {
-                uart_send_str("WARN: VDDEXT not stable (excitation down)\r\n");
                 fault_raise_vddext();
-                break;   /* proceed to the command loop anyway */
+                break;   /* proceed to the main loop anyway */
             }
         }
     }
-    diag_mark("vddext");               /* TEMP bring-up diagnostic           */
-
-    diag_mark("loop");                 /* TEMP bring-up diagnostic           */
 
     /* ================================================================== */
     /*  Super-loop — cooperative, non-blocking, run-to-completion tasks   */
     /* ================================================================== */
     for (;;)
     {
-        /* TEMP bring-up diagnostics: stamp the first 3 WDT1 services and
-         * the first refresh, so a capture shows how far each boot gets.   */
-        static uint8 diag_svc_count = 0u;
-        static bool  diag_refreshed = false;
+        /* Refresh deferral state: the scheduler flag is consume-once, so it
+         * is latched here and only cleared when the refresh actually runs. */
+        static bool  refresh_due;
+        static uint8 refresh_defers;
 
         /* — Tick / WDT1 ------------------------------------------------ */
-        if (scheduler_service() && (diag_svc_count < 3u))
+        (void)scheduler_service();
+
+        /* — Periodic pipeline (sample → fault → cal → link code) -------- *
+         * FENCED: acquisition can stall ~34 ms when the ADC is dead — the
+         * exact condition whose fault code the wire must carry — so the
+         * packet engine is brought to a wire-idle hold first. Predictable
+         * stalls POSTPONE packets; they never tear one. If the fence can't
+         * be acquired (wedged UART), the refresh defers and retries, with
+         * a 3-strike escape so acquisition is never starved. In bench
+         * console mode the stream is suspended and no fence is needed.     */
+        if (scheduler_refresh_pending()) { refresh_due = true; }
+        if (refresh_due)
         {
-            diag_svc_count++;
-            diag_mark("wdt-svc");
-        }
-
-        /* — Periodic pipeline (sample → fault → cal → output) ---------- */
-        if (scheduler_refresh_pending())
-        {
-            if (!diag_refreshed)       /* TEMP bring-up diagnostic          */
+            bool fenced = false;
+            bool safe   = link_tx_console_active();
+            if (!safe)
             {
-                diag_refreshed = true;
-                diag_mark("refresh");
-            }
-            acquisition_run(&acq);
-
-            /* System supervision: a dead/stalled ADC or a sagging VDDEXT
-             * both make readings untrustworthy while the probes still AGREE
-             * (the disagreement check can't catch either). The two causes
-             * are tracked independently so the output can report WHICH one
-             * is active. On VDDEXT instability, attempt a re-enable —
-             * recovers a latched-off regulator (overtemp/undervoltage),
-             * not just a sag.                                              */
-            if (acq.stalled)
-            {
-                fault_raise_adc();
-            }
-            else
-            {
-                fault_clear_adc();
+                fenced = link_tx_fence_bounded();
+                safe   = fenced || (refresh_defers >= 3u);
             }
 
-            if (vddext_stable() || PMU_VDDEXT_On())
+            if (safe)
             {
-                fault_clear_vddext();
-            }
-            else
-            {
-                fault_raise_vddext();
-            }
+                uint16 code;
 
-            /* Fault check — disagreement only makes sense with two probes */
-            if (nvm_config_get_probe_mode() == PROBE_MODE_DUAL)
-            {
-                fault_check(acq.probe_a, acq.probe_b);
-            }
-            else
-            {
-                fault_clear();   /* single probe: clear any latched fault */
-            }
+                refresh_due    = false;
+                refresh_defers = 0u;
 
-            /* Calibration capture accumulator — pause while a fault is
-             * active so a corrupted reading can't be averaged into a point */
-            if (!fault_is_active())
-            {
-                cal_state_t before = calibration_get_state();
-                calibration_service(acq.combined);
-                if (before == CAL_CAPTURING && calibration_get_state() == CAL_ARMED)
+                acquisition_run(&acq);
+
+                /* System supervision: a dead/stalled ADC or a sagging
+                 * VDDEXT both make readings untrustworthy while the probes
+                 * still AGREE (the disagreement check can't catch either).
+                 * Tracked per-cause so the wire reports WHICH one. On
+                 * VDDEXT instability, attempt a re-enable — recovers a
+                 * latched-off regulator, not just a sag.                   */
+                if (acq.stalled) { fault_raise_adc(); }
+                else             { fault_clear_adc(); }
+
+                if (vddext_stable() || PMU_VDDEXT_On())
                 {
-                    uart_send_str("Captured (");
-                    uart_send_u16(calibration_get_num_points());
-                    uart_send_str(" pts)\r\n");
+                    fault_clear_vddext();
                 }
-            }
+                else
+                {
+                    fault_raise_vddext();
+                }
 
-            /* Output stage — fault overrides everything; a valid cal keeps
-             * driving the line even while a new cal session is armed (no
-             * step back to the raw-counts mapping on the battery line).    */
-            if (fault_is_active())
-            {
-                output_set_fault_low();
-            }
-            else if (calibration_is_valid())
-            {
-                output_set_pressure_bar(calibration_apply(acq.combined));
+                /* Fault check — disagreement only means something with two
+                 * probes.                                                  */
+                if (nvm_config_get_probe_mode() == PROBE_MODE_DUAL)
+                {
+                    fault_check(acq.probe_a, acq.probe_b);
+                }
+                else
+                {
+                    fault_clear();   /* single probe: clear latched fault  */
+                }
+
+                /* Calibration capture accumulator — pause while a fault is
+                 * active so a corrupted reading can't average into a point */
+                if (!fault_is_active())
+                {
+                    cal_state_t before = calibration_get_state();
+                    calibration_service(acq.combined);
+                    if (before == CAL_CAPTURING &&
+                        calibration_get_state() == CAL_ARMED)
+                    {
+                        uart_send_str("Captured (");
+                        uart_send_u16(calibration_get_num_points());
+                        uart_send_str(" pts)\r\n");
+                    }
+                }
+
+                /* Link code — priority ladder (one code per packet; the
+                 * bench console can list all causes). Uncalibrated sends a
+                 * status code, NEVER raw counts dressed up as pressure.    */
+                if      (fault_adc_active())      { code = (uint16)LINK_CODE_ADC_STALL; }
+                else if (fault_vddext_active())   { code = (uint16)LINK_CODE_VDDEXT; }
+                else if (fault_disagree_active()) { code = (uint16)LINK_CODE_DISAGREE; }
+                else if (calibration_is_valid())
+                {
+                    code = link_encode_bar(calibration_apply(acq.combined));
+                }
+                else                              { code = (uint16)LINK_CODE_UNCAL; }
+                link_tx_set_live_code(code);
+
+                if (fenced) { link_tx_release(); }
+
+                /* AUTO stream last, so the line reflects THIS cycle's
+                 * state (debug console, unlocked sessions only).           */
+                uart_cmd_update_readings(acq.probe_a, acq.probe_b, acq.combined);
             }
             else
             {
-                output_set_pressure(acq.combined);
+                refresh_defers++;
             }
-
-            /* AUTO stream last, so the line reflects THIS cycle's fault
-             * state, output voltage, and drive-path tag.                   */
-            uart_cmd_update_readings(acq.probe_a, acq.probe_b, acq.combined);
         }
 
-        /* — Cooperative background tasks -------------------------------- */
+        /* — Cooperative background tasks -------------------------------- *
+         * Link first: it owns the tightest deadline on the wire.          */
+        link_tx_service();
         led_arbitrate();
         status_led_service();
         uart_cmd_service();
