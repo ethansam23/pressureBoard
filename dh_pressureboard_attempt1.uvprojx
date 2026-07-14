@@ -479,9 +479,14 @@
               <FilePath>.\app\acquisition.c</FilePath>
             </File>
             <File>
-              <FileName>output.c</FileName>
+              <FileName>link_frame.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\app\output.c</FilePath>
+              <FilePath>.\app\link_frame.c</FilePath>
+            </File>
+            <File>
+              <FileName>link_tx.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\link_tx.c</FilePath>
             </File>
             <File>
               <FileName>calibration.c</FileName>
