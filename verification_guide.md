@@ -42,13 +42,23 @@ Capture several packets; measure:
 
 | Measurement | Limit | Nominal | Worst observed |
 |---|---|---|---|
-| Sync start bit → checksum stop-bit end (total packet) | **< 9.5 ms** | ~8.3 ms | _____ |
-| Sync stop-bit end → first data start bit (gap) | **2.9 – 5.0 ms** | ~3.4 ms | _____ |
+| Sync start bit → checksum stop-bit end (total packet) | **< 9.5 ms** | ~7.6–8.3 ms | _____ |
+| Sync stop-bit end → first data start bit (gap) | **2.9 – 5.0 ms** | ~3.4–4.1 ms | _____ |
 | Spacing between the 3 data bytes | back-to-back (no gap > 1 bit) | 0 | _____ |
-| Checksum end → next line activity (idle) | **≥ 22 ms** | ~31 ms | _____ |
+| Checksum end → next line activity (idle) | **≥ 21.8 ms** | ~31 ms | _____ |
 | Sync-start → sync-start (period) | 40 ms ± 1 ms | 40 ms | _____ |
 | Bit width (baud accuracy) | 104.2 µs ± 2 % | 104.2 µs | _____ |
 | Idle-high voltage | per logger divider spec | _____ | _____ |
+
+> Nominal-column note (2026-07-13 pre-bench audit): on any single packet,
+> total = gap + 4.17 ms (four bytes at 9600 8N1, data back-to-back); the
+> ranges above are the SysTick tick-phase span seen in the host simulation.
+> Idle-floor note: the firmware enforces 23 ms in TI-tick arithmetic; tick
+> quantization minus the 1-bit TI-lead hypothesis puts the guaranteed wire
+> idle at ≥ 21.8 ms. A measured ~21.9 ms (console-LOCK resume path is the
+> only case that can approach it) is in-spec — the logger floor is > 20 ms —
+> not a failure. ≥ 22.0 ms is guaranteed only if the TI-offset check below
+> shows TI at the stop-bit END.
 
 - [ ] **TI-offset check (resolves the timing hypothesis):** with `LINKTEST`
       toggling a known code, compare a scope-measured byte end (stop-bit
@@ -71,9 +81,11 @@ Capture several packets; measure:
       `[WDT1]`)
 - [ ] Echo/backspace now work; `STATUS` prints 5 lines incl.
       `mode=CONSOLE (stream suspended)` and `pkts=` (a number ~25×seconds
-      since boot)
-- [ ] `CONSOLE LOCK` → goodbye line, then scope shows ≥ 22 ms quiet, then a
-      SINGLE packet (no burst), then normal 40 ms cadence
+      spent in packet mode — the counter freezes while unlocked, so this
+      ≈ seconds-since-boot only here at the first unlock)
+- [ ] `CONSOLE LOCK` → goodbye line, then scope shows ≥ 21.8 ms quiet (see
+      Test 2 idle-floor note), then a SINGLE packet (no burst), then normal
+      40 ms cadence
 - [ ] Unlock again, wait 5+ min without typing → firmware auto-relocks and
       the stream resumes on its own
 - [ ] Host monitor: "Enter Bench Mode" does all of the above from the GUI;
@@ -174,7 +186,8 @@ Stable pressure on both probes, unlock:
 
 Fresh flash of this firmware over the old one:
 
-- [ ] First boot: defaults active (`Rate: 1000ms Thresh: 80`), `Cal: NONE`,
+- [ ] First boot: defaults active (`Rate: 1000ms  Thresh: 80  NVM: ok` —
+      two spaces between fields, NVM health field always present), `Cal: NONE`,
       wire shows `0xFF02` UNCAL — old NVM intentionally rejected
 - [ ] Re-enter site settings; verify persistence (Test 7)
 
@@ -196,7 +209,8 @@ Fresh flash of this firmware over the old one:
       calibrated
 - [ ] `CAL CLEAR` → wire returns to `0xFF02` UNCAL (never raw counts)
 - [ ] Error paths: `CAL 500` unarmed → `ERR: CAL ARM first`; `CAL STORE` at
-      <2 pts → `ERR: need >=2 pts`; 9th point → `ERR: max 8 pts`
+      <2 pts → `ERR: need >=2 pts`; 9th point → `ERR: max 8 pts (STORE or
+      ABORT)`
 
 ## Test 12 — Watchdog soak (standalone)
 

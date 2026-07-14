@@ -141,8 +141,14 @@ class LinkDecoder:
         return self.streak >= 2
 
     def frame_rate(self):
-        """Coarse packets/second from chunk timestamps (hint only)."""
-        iv = [x for x in self.frame_intervals if x > 0]
-        if len(iv) < 4:
+        """Coarse packets/second from chunk timestamps (hint only).
+
+        Frames arriving in the same read chunk share one timestamp, so their
+        intervals are 0 — they must still count as frames (numerator) even
+        though they add nothing to the elapsed time (denominator)."""
+        if len(self.frame_intervals) < 4:
             return None
-        return len(iv) / sum(iv)
+        total = sum(self.frame_intervals)
+        if total <= 0:
+            return None
+        return len(self.frame_intervals) / total

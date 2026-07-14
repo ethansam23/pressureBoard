@@ -73,6 +73,20 @@ class TestCleanStream(unittest.TestCase):
         ev = d.feed(stream([0x7F7F, 42]))
         self.assertEqual(frames(ev), [0x7F7F, 42])
 
+    def test_frame_rate_chunked_timestamps(self):
+        # The GUI reads the serial port in ~0.1 s chunks, so 2-3 frames of a
+        # 25/s stream share one timestamp (zero intervals). frame_rate() must
+        # still report ~25/s, not the chunk cadence (~10/s).
+        d = LinkDecoder()
+        by_chunk = {}
+        for j in range(250):                    # 250 frames = 10 s at 25/s
+            by_chunk.setdefault(int(j * 0.040 / 0.1), []).append(j)
+        for c in sorted(by_chunk):
+            d.feed(stream([42] * len(by_chunk[c])), t=(c + 1) * 0.1)
+        rate = d.frame_rate()
+        self.assertIsNotNone(rate)
+        self.assertAlmostEqual(rate, 25.0, delta=1.5)
+
     def test_chunked_feeds(self):
         data = stream(list(range(0, 2000, 7)))
         expect = list(range(0, 2000, 7))
