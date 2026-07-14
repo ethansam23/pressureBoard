@@ -91,3 +91,15 @@ Build: 0 errors / 0 warnings; boot diagnostics (`RST …`, `t=` markers,
 - ±1–2 bar acceptance vs sensor's ±2.5 bar floor + temp coefficients
 - Current-mirror voltage compliance at temperature (scope it)
 - POWER characterization (measure mW per RATE; table goes in then)
+
+---
+
+## SUPERSEDED (14 Jul 2026 — digital-link rearchitecture)
+
+The analog-output items above (P0.1 voltages, OUTPUT command, fault-band
+levels, RANGE) are obsolete: the PWM-DAC was replaced by the one-way UART
+packet stream on P1.0 (see `link_protocol.md`). Open items now tracked in
+`TLE9854_pressure_transmitter_PRD_rev2.md` §10 and the rewritten
+`verification_guide.md`. Still-valid learnings carried forward: J-Link-
+attached NVM freezes (keep memory windows closed), the WDT1 double-count
+history, and the standalone power-cycle discipline.

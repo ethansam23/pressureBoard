@@ -1,5 +1,10 @@
 # TLE9854QXW Pressure Transmitter — PRD · Rev 1
 
+> **SUPERSEDED by `TLE9854_pressure_transmitter_PRD_rev2.md` (14 Jul 2026).**
+> Rev 2 replaces the analog 0–5 V output with a one-way digital UART packet
+> stream (`link_protocol.md`), removes RANGE and the v2 synced-sleep scope,
+> and adds TX-purity + logger-side requirements. Kept for history only.
+
 _Rev 1 — 6 Jun 2026. ("v1 / v2" below refer to firmware scope, not the document revision.) Companion to `TLE9854_pressure_transmitter_design_notes.md` (background/decision log)._
 
 ## 1. Summary
