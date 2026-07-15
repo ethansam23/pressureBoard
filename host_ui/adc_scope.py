@@ -12,6 +12,7 @@ Keys in the plot window:
   a / b : switch channel (Probe A = AN7/P2.7, Probe B = AN3/P2.3)
   t     : burst capture -> new figure with a microsecond x-axis (+ .npy autosave)
   r     : toggle full-rate recording (.npy)
+  z     : toggle Y auto-zoom (default on) vs full 0-1023 scale
 
 Usage:
   python adc_scope.py COM5 [--baud 1000000] [--window 5] [--record out.npy]
@@ -203,6 +204,8 @@ def run_gui(scope):
     status = ax.set_title("connecting...")
 
     cols = 1600
+    zoom = [True]                  # 'z' toggles auto-zoom vs full scale
+    ylim = [0.0, 1023.0]           # smoothed current limits
 
     def frame(_):
         with scope.lock:
@@ -218,6 +221,18 @@ def run_gui(scope):
         fill[0] = ax.fill_between(x, lo, hi, alpha=0.3,
                                   color=ln_min.get_color())
         ax.set_xlim(x[0], 0.0)
+        if zoom[0]:
+            pad = max(2.0, (float(hi.max()) - float(lo.min())) * 0.15)
+            tgt_lo = max(0.0, float(lo.min()) - pad)
+            tgt_hi = min(1023.0, float(hi.max()) + pad)
+            if tgt_hi - tgt_lo < 8.0:                # never tighter than 8 LSB
+                mid = (tgt_hi + tgt_lo) / 2.0
+                tgt_lo, tgt_hi = mid - 4.0, mid + 4.0
+            ylim[0] += (tgt_lo - ylim[0]) * 0.3      # smooth, no jitter
+            ylim[1] += (tgt_hi - ylim[1]) * 0.3
+            ax.set_ylim(ylim[0], ylim[1])
+        else:
+            ax.set_ylim(0, 1023)
         recent = buf[-int(max(scope.rate, 1000.0)):]
         status.set_text(
             "ch %s   %.1f kS/s   mean %.1f   sigma %.2f   p-p %d   "
@@ -265,6 +280,8 @@ def run_gui(scope):
                 scope.save_recording()
             else:
                 scope.recording = True
+        elif ev.key in ("z", "Z"):
+            zoom[0] = not zoom[0]
 
     fig.canvas.mpl_connect("key_press_event", on_key)
     _anim = FuncAnimation(fig, frame, interval=50, cache_frame_data=False)
