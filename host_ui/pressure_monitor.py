@@ -317,6 +317,13 @@ class App(ctk.CTk):
                               font=self.f_lbl, state="disabled")
             b.pack(side="left", padx=4)
             self.quick_btns.append(b)
+        # Opt-in only: a continuous poll would spam the log and its RX
+        # traffic defeats the firmware's 5-min inactivity auto-relock.
+        self.var_poll = tk.BooleanVar(value=False)
+        self.chk_poll = ctk.CTkCheckBox(
+            qb, text="Auto-refresh STATUS (4 s)", variable=self.var_poll,
+            font=self.f_lbl, checkbox_width=16, checkbox_height=16)
+        self.chk_poll.pack(side="left", padx=12)
 
         # Passive-mode notice
         self.lbl_mode = ctk.CTkLabel(
@@ -465,8 +472,10 @@ class App(ctk.CTk):
         except queue.Empty:
             pass
 
-        # bench mode: periodic STATUS keeps config strip fresh
-        if self.worker and self.bench and (time.time() - self._last_status) > 4.0:
+        # bench mode: OPT-IN periodic STATUS keeps config strip fresh
+        # (default off — see checkbox note in _build)
+        if (self.worker and self.bench and self.var_poll.get()
+                and (time.time() - self._last_status) > 4.0):
             self._last_status = time.time()
             self.worker.send("STATUS")
 
