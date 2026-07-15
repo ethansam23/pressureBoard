@@ -4,10 +4,11 @@ Same wire protocol and serial/decoder engine as adc_scope.py (imported from
 it); only the display differs: pyqtgraph's native peak (min/max) downsampling
 renders the full-rate ring every frame, and mouse wheel/drag zoom works live.
 
-A configurable moving-average overlay (orange) can be enabled from the
-control bar — default window 16 samples, deliberately matching the
-firmware's 16x oversample: the orange trace approximates what production
-filtering would see, the raw trace is what actually happened.
+A configurable post-process filter overlay (orange) can be selected in the
+control bar: Moving avg / EMA / Median / Median>MA / Butterworth, all
+sharing one 'equivalent MA length N' knob (default 16, matching the
+firmware's 16x oversample: the orange trace approximates what candidate
+firmware filtering would see; the raw trace is what actually happened).
 
 Keys (click the plot first so it has focus):
   A / B : switch channel      T : burst capture (new window, us axis, .npy)
@@ -23,16 +24,46 @@ import time
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
+from scipy import ndimage, signal
 
 from adc_scope import Scope, LSB_MV
 
 AVG_PEN = pg.mkPen("#ff8c00", width=1.5)
+
+FILTERS = ["Off", "Moving avg", "EMA", "Median", "Median>MA", "Butterworth"]
 
 
 def moving_avg(y, n):
     """Causal moving average; returns len(y)-n+1 points aligned to y[n-1:]."""
     c = np.cumsum(np.insert(y.astype(np.float64), 0, 0.0))
     return (c[n:] - c[:-n]) / float(n)
+
+
+def apply_filter(y, kind, n, fs):
+    """Post-process filter bank. All share the 'equivalent MA length N' knob
+    (EMA alpha = 2/(N+1); Butterworth fc matched to the MA's -3 dB point).
+    Returns (sample_offset, filtered) — offset aligns output to y[offset:]."""
+    y = y.astype(np.float64)
+    if kind == "Moving avg":
+        return n - 1, moving_avg(y, n)
+    if kind == "EMA":
+        a = 2.0 / (n + 1.0)
+        zi = np.array([(1.0 - a) * y[0]])          # settle at y[0], no ramp-in
+        out, _ = signal.lfilter([a], [1.0, a - 1.0], y, zi=zi)
+        return 0, out
+    if kind == "Median":
+        size = min(n | 1, 99)                      # odd; capped for frame rate
+        return 0, ndimage.median_filter(y, size=size, mode="nearest")
+    if kind == "Median>MA":                        # 5-tap glitch killer, then MA
+        pre = ndimage.median_filter(y, size=5, mode="nearest")
+        return n - 1, moving_avg(pre, n)
+    if kind == "Butterworth":                      # 2nd order, fc = MA -3 dB eq.
+        fc = min(0.443 * fs / n, 0.45 * fs)
+        sos = signal.butter(2, fc, fs=fs, output="sos")
+        zi = signal.sosfilt_zi(sos) * y[0]
+        out, _ = signal.sosfilt(sos, y, zi=zi)
+        return 0, out
+    return 0, y
 
 
 class ScopeWindow(QtWidgets.QWidget):
@@ -52,14 +83,20 @@ class ScopeWindow(QtWidgets.QWidget):
         self.avg_curve.setDownsampling(auto=True, method="peak")
         self.plot.setClipToView(True)
 
-        self.chk_avg = QtWidgets.QCheckBox("Moving average (orange)")
+        self.cmb_filt = QtWidgets.QComboBox()
+        self.cmb_filt.addItems(FILTERS)
+        self.cmb_filt.setToolTip(
+            "Overlay filter (orange). All use the same N: EMA alpha=2/(N+1),\n"
+            "Butterworth fc = the length-N moving average's -3 dB point.\n"
+            "Median>MA = 5-tap median (glitch removal) then moving average.")
         self.spin_n = QtWidgets.QSpinBox()
         self.spin_n.setRange(2, 4096)
         self.spin_n.setValue(16)                   # = firmware oversample
         self.spin_n.setSuffix(" samples")
         self.spin_n.setToolTip("16 mirrors the production 16x oversample")
         bar = QtWidgets.QHBoxLayout()
-        bar.addWidget(self.chk_avg)
+        bar.addWidget(QtWidgets.QLabel("Filter (orange):"))
+        bar.addWidget(self.cmb_filt)
         bar.addWidget(self.spin_n)
         bar.addStretch(1)
 
@@ -94,10 +131,14 @@ class ScopeWindow(QtWidgets.QWidget):
         self.curve.setData(x, buf)
 
         n = self.spin_n.value()
-        if self.chk_avg.isChecked() and n >= 2 and n < len(buf):
-            avg = moving_avg(buf, n)
-            self.avg_curve.setData(x[n - 1:], avg)
-        else:
+        kind = self.cmb_filt.currentText()
+        heavy = kind in ("Median", "Median>MA")    # C, but O(size) per point
+        if kind != "Off" and n >= 2 and n < len(buf) and \
+                (not heavy or self.stat_div % 3 == 0 or
+                 self.avg_curve.xData is None):
+            off, out = apply_filter(buf, kind, n, rate)
+            self.avg_curve.setData(x[off:], out)
+        elif kind == "Off":
             self.avg_curve.setData([], [])
 
         self.stat_div = (self.stat_div + 1) % 6
@@ -128,8 +169,11 @@ class ScopeWindow(QtWidgets.QWidget):
         w.setLabel("bottom", "us")
         w.setLabel("left", "ADC counts")
         n = self.spin_n.value()
-        if self.chk_avg.isChecked() and n >= 2 and n < len(samples):
-            w.plot(t_us[n - 1:], moving_avg(samples, n), pen=AVG_PEN)
+        kind = self.cmb_filt.currentText()
+        if kind != "Off" and n >= 2 and n < len(samples):
+            fs_burst = len(samples) / max(dur_us, 1) * 1e6
+            off, out = apply_filter(samples, kind, n, fs_burst)
+            w.plot(t_us[off:], out, pen=AVG_PEN)
         if not hasattr(self, "_bursts"):
             self._bursts = []
         self._bursts.append(w)                     # keep a ref or Qt closes it
