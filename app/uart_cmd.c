@@ -28,15 +28,16 @@
  * bytes this firmware can ever emit.
  ******************************************************************************/
 
-/* ---- Ring buffers ------------------------------------------------------- */
+/* ---- Ring buffers (arrays exist in console builds only — 1.2 KB of the
+ * 4 KB SRAM; the head/tail/len scalars stay: always-compiled code checks
+ * them, and with the console out they just read forever-empty) ------------ */
+#if LINK_CONSOLE_EN
 static volatile uint8  tx_buf[UART_TX_BUF_SIZE];
-static volatile uint16 tx_head, tx_tail;
-
 static volatile uint8  rx_buf[UART_RX_BUF_SIZE];
-static volatile uint16 rx_head, rx_tail;
-
-/* ---- Command line buffer ------------------------------------------------ */
 static uint8  cmd_buf[UART_CMD_BUF_SIZE];
+#endif
+static volatile uint16 tx_head, tx_tail;
+static volatile uint16 rx_head, rx_tail;
 static uint8  cmd_len;
 
 /* ---- Latest readings (updated by main loop) ----------------------------- */

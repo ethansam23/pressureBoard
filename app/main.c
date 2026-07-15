@@ -1,218 +1,213 @@
+/* ===========================================================================
+ * EXPERIMENTAL BENCH-ONLY FIRMWARE — branch exp/adc-scope. NEVER DEPLOY.
+ *
+ * Turns the board into a diagnostic ADC scope: raw single 10-bit conversions
+ * (NO oversampling) streamed on UART2/P1.0 at ADC_SCOPE_BAUD (1 Mbaud,
+ * ~50 kS/s), plus a RAM burst capture at full polled-ADC speed (~µs
+ * resolution). P1.0 carries THIS raw stream, not the logger protocol — the
+ * production modules (link_tx/link_frame/uart_cmd/calibration/fault/nvm)
+ * still compile but are never called: their timing is 9600-hardcoded.
+ *
+ * Wire format (stream), 2 bytes per sample, self-syncing:
+ *   b0 = 0x80 | ch<<6 | seq2<<4 | sample[9:6]      (bit7 = 1: frame start)
+ *   b1 = sample[5:0]                               (bit7 = 0)
+ *   ch: 0 = Probe A (AN7/P2.7), 1 = Probe B (AN3/P2.3); seq2 = rolling
+ *   2-bit counter for drop detection.
+ * Host commands (single bytes): 'A'/'B' switch channel, 'T' burst capture.
+ * Burst dump: 0xF0 0x0F, count u16 LE, duration_us u16 LE, count × sample
+ * (lo, hi — hi ≤ 0x07), then an 8-bit additive checksum over count/duration/
+ * payload bytes. Invalid conversions are stored as 0x0400.
+ *
+ * WDT1 law unchanged: SystemInit issued the first trigger; servicing only
+ * via scheduler_service()/WDT1_Service() — every loop state honors the
+ * ~300 ms budget.
+ * ========================================================================= */
 #include "tle_device.h"
 #include "app_config.h"
 #include "scheduler.h"
-#include "status_led.h"
-#include "acquisition.h"
-#include "link_frame.h"
-#include "link_tx.h"
-#include "calibration.h"
-#include "fault.h"
-#include "nvm_config.h"
-#include "uart_cmd.h"
 
-static acq_result_t acq;
+#if LINK_CONSOLE_EN
+#error "exp/adc-scope requires LINK_CONSOLE_EN=0 (RAM for the burst buffer)"
+#endif
 
-/* VDDEXT_CTRL.STABLE without the enable+200 µs delay of PMU_VDDEXT_On() —
- * used for the per-refresh excitation supervision. */
-static bool vddext_stable(void)
+static uint16 burst_buf[ADC_SCOPE_BURST_N];
+
+/* ---- one raw conversion (mirrors acquisition.c sample_one) --------------- */
+static bool convert(uint8 ch, uint16 *out)
 {
-    return (u1_Field_Rd32(&PMU->VDDEXT_CTRL.reg,
-                          (uint8)PMU_VDDEXT_CTRL_VDDEXT_STABLE_Pos,
-                          PMU_VDDEXT_CTRL_VDDEXT_STABLE_Msk) == 1u);
+    uint16 val   = 0u;
+    uint32 guard = ADC_EOC_TIMEOUT_SPINS;
+
+    ADC1_SetSosSwMode(ch);
+    while (ADC1_GetEocSwMode() == false)
+    {
+        if (guard == 0u) { return false; }   /* bounded — never spin forever */
+        guard--;
+    }
+    if (ADC1_GetChResult(&val, ch) == false) { return false; }
+    *out = val;
+    return true;
 }
 
-/* Single owner of the LED pattern. Modules no longer set the LED directly
- * (they used to overwrite each other); the one exception is the transient
- * CAL_STORED "solid 2 s" pushed by calibration_store(), which is allowed to
- * finish before arbitration resumes.
- * Priority: fault > cal capturing > cal armed > heartbeat. */
-static void led_arbitrate(void)
+/* Mux-settle throwaway — needed once after every channel switch only. */
+static void channel_select(uint8 ch)
 {
-    led_state_t cur = status_led_get_state();
-    led_state_t desired;
-    cal_state_t cs = calibration_get_state();
+    uint16 dummy;
+    (void)convert(ch, &dummy);
+}
 
-    if (cur == LED_STATE_CAL_STORED) { return; }
+/* ---- polled TX (vendor stdout_putchar pattern; ints stay disabled) ------- */
+static void tx_byte(uint8 b)
+{
+    UART2_Send_Byte(b);
+    while (UART2_isByteTransmitted() == false) { }
+}
 
-    if (fault_is_active())        { desired = LED_STATE_FAULT; }
-    else if (cs == CAL_CAPTURING) { desired = LED_STATE_CAL_CAPTURING; }
-    else if (cs == CAL_ARMED)     { desired = LED_STATE_CAL_ARMED; }
-    else                          { desired = LED_STATE_HEARTBEAT; }
+/* ---- burst: capture at full ADC speed, then dump slowly ------------------ */
+static void burst_run(uint8 ch)
+{
+    uint32 tpu = (SysTick->LOAD + 1u) / 1000u;    /* SysTick ticks per µs     */
+    uint32 ms0, ms1, st0, st1, ticks, us;
+    uint16 i;
+    uint8  sum = 0u;
 
-    if (desired != cur) { status_led_set_state(desired); }
+    (void)WDT1_Service();
+
+    ms0 = scheduler_get_ms();
+    st0 = SysTick->VAL;                            /* counts DOWN             */
+    for (i = 0u; i < (uint16)ADC_SCOPE_BURST_N; i++)
+    {
+        uint16 v;
+        if (convert(ch, &v) == false) { v = 0x0400u; }   /* invalid marker    */
+        burst_buf[i] = v;
+    }
+    ms1 = scheduler_get_ms();
+    st1 = SysTick->VAL;
+
+    (void)WDT1_Service();
+
+    /* Elapsed µs from ms counter + SysTick phase (modular math is exact). */
+    ticks = ((ms1 - ms0) * (SysTick->LOAD + 1u)) + st0 - st1;
+    us    = ticks / tpu;
+    if (us > 0xFFFFu) { us = 0xFFFFu; }
+
+    tx_byte(0xF0u);
+    tx_byte(0x0Fu);
+    {
+        uint8 hdr[4];
+        hdr[0] = (uint8)(ADC_SCOPE_BURST_N & 0xFFu);
+        hdr[1] = (uint8)((ADC_SCOPE_BURST_N >> 8) & 0xFFu);
+        hdr[2] = (uint8)(us & 0xFFu);
+        hdr[3] = (uint8)((us >> 8) & 0xFFu);
+        for (i = 0u; i < 4u; i++) { tx_byte(hdr[i]); sum = (uint8)(sum + hdr[i]); }
+    }
+    for (i = 0u; i < (uint16)ADC_SCOPE_BURST_N; i++)
+    {
+        uint8 lo = (uint8)(burst_buf[i] & 0xFFu);
+        uint8 hi = (uint8)((burst_buf[i] >> 8) & 0xFFu);
+        (void)scheduler_service();                 /* WDT during the ~26 ms dump */
+        tx_byte(lo); sum = (uint8)(sum + lo);
+        tx_byte(hi); sum = (uint8)(sum + hi);
+    }
+    tx_byte(sum);
 }
 
 int main(void)
 {
-    /* ---- SDK init --------------------------------------------------------- *
-     * The startup code already ran SystemInit() (system_tle985x.c), which
-     * issued the FIRST WDT1 trigger — ending the 200 ms power-up long open
-     * window — and started SysTick. Do NOT call WDT1_Init() or trigger WDT1
-     * here: a second trigger a few ms after the first lands in the CLOSED
-     * window -> reset, and 5 such resets latch the chip into Sleep Mode.
-     * (Invisible under J-Link — WDT1 is disabled in Debug Mode.) The next
-     * service happens in scheduler_service() once the window opens
-     * (WD_Counter > 699 ms, counted by WDT1_Window_Count() in
-     * scheduler_tick()).                                                     */
+    uint8  ch     = ADC_CH_PROBE_A;
+    uint8  ch_bit = 0u;
+    uint8  seq    = 0u;
+    uint32 led_ctr = 0u;
+    bool   led_on  = false;
+
+    /* SystemInit() already issued the FIRST WDT1 trigger and started
+     * SysTick — do NOT call WDT1_Init() or trigger WDT1 here (a second
+     * trigger in the closed window resets; 5 resets latch Sleep Mode).      */
     TLE_Init();
-
-    /* ---- Application module init ---------------------------------------- */
     scheduler_init();
-    nvm_config_init();
-    scheduler_set_rate_ms(nvm_config_get_rate_ms());
 
-    status_led_init();
-    acquisition_init();
-    link_tx_init();             /* owns UART2; the packet stream is alive from
-                                 * here, carrying NO_READING (boot fail-safe:
-                                 * the wire never shows a fake pressure)      */
-    calibration_init();
-    fault_init();
-    uart_cmd_init();            /* debug builds: console RX, BOOTS LOCKED —
-                                 * zero TX text until CONSOLE UNLOCK          */
+    PORT_P04_Output_Set();                         /* status LED, push-pull   */
+    PORT_P04_Output_Low_Set();
 
-    /* Reset cause: captured for the console unlock banner (nothing may
-     * print at boot — the wire carries packets only), then cleared so the
-     * next boot reports fresh.                                              */
-    uart_cmd_set_boot_info(PMU->RESET_STS.reg, PMU->WFS.reg);
-    PMU->RESET_STS.reg = 0u;
-
-    /* ---- Enable VDDEXT; BOUNDED wait for it to stabilize ---------------- *
-     * Never spin here forever. VDDEXT can latch off (undervoltage/overtemp),
-     * and a warm NRST may not clear that latch -> an unbounded wait would
-     * hang on every reset with the rail down. Time-box it; on timeout latch
-     * the VDDEXT fault so the wire carries its code — LED and console are
-     * bench-only and invisible downhole. The link is serviced THROUGHOUT
-     * the wait so the stream starts on schedule.                            */
+    /* VDDEXT excitation for the bridges — BOUNDED wait, same rule as the
+     * production firmware: never spin forever on a rail that may be latched
+     * off. On timeout, stream anyway (the data itself shows the sag).       */
     {
-        uint32 vddext_t0 = scheduler_get_ms();
+        uint32 t0 = scheduler_get_ms();
         while (PMU_VDDEXT_On() == false)
         {
             (void)WDT1_Service();
-            link_tx_service();
-            if ((scheduler_get_ms() - vddext_t0) >= VDDEXT_SETTLE_TIMEOUT_MS)
+            if ((scheduler_get_ms() - t0) >= VDDEXT_SETTLE_TIMEOUT_MS)
             {
-                fault_raise_vddext();
-                break;   /* proceed to the main loop anyway */
+                break;
             }
         }
     }
 
-    /* ================================================================== */
-    /*  Super-loop — cooperative, non-blocking, run-to-completion tasks   */
-    /* ================================================================== */
+    /* UART2 on P1.0 (alt 3) — polled I/O only, module interrupts off.
+     * Pin/mode setup mirrors link_tx_init(); baud is the experiment's.      */
+    PORT_P10_Output_Set();
+    PORT_ChangePinAlt(0x10u, 3u);
+    PORT_P11_PullUp_Set();                         /* RX idle-high            */
+    PORT_P11_PullUpDown_En();
+    UART2->SCON.reg |= (uint32)((1u << 6u) | (1u << 4u));  /* SM1 + REN       */
+    UART2_BaudRate_Set(ADC_SCOPE_BAUD);
+    UART2_TX_Int_Dis();
+    UART2_RX_Int_Dis();
+    UART2_RX_Int_Clr();
+
+    ADC1_Software_Mode_Sel();
+    channel_select(ch);
+
+    /* ---- stream loop: TX-paced at 2 bytes/sample ------------------------- */
     for (;;)
     {
-        /* Refresh deferral state: the scheduler flag is consume-once, so it
-         * is latched here and only cleared when the refresh actually runs. */
-        static bool  refresh_due;
-        static uint8 refresh_defers;
+        uint16 sample;
+        uint8  b0, b1;
 
-        /* — Tick / WDT1 ------------------------------------------------ */
-        (void)scheduler_service();
+        (void)scheduler_service();                 /* WDT1, every pass        */
 
-        /* — Periodic pipeline (sample → fault → cal → link code) -------- *
-         * FENCED: acquisition can stall ~34 ms when the ADC is dead — the
-         * exact condition whose fault code the wire must carry — so the
-         * packet engine is brought to a wire-idle hold first. Predictable
-         * stalls POSTPONE packets; they never tear one. If the fence can't
-         * be acquired (wedged UART), the refresh defers and retries, with
-         * a 3-strike escape so acquisition is never starved. In bench
-         * console mode the stream is suspended and no fence is needed.     */
-        if (scheduler_refresh_pending()) { refresh_due = true; }
-        if (refresh_due)
+        if (UART2_RX_Sts() == 1u)                  /* 1-byte host commands    */
         {
-            bool fenced = false;
-            bool safe   = link_tx_console_active();
-            if (!safe)
+            uint8 c = UART2_Get_Byte();
+            UART2_RX_Int_Clr();
+            if ((c == (uint8)'A') || (c == (uint8)'a'))
             {
-                fenced = link_tx_fence_bounded();
-                safe   = fenced || (refresh_defers >= 3u);
+                ch = ADC_CH_PROBE_A; ch_bit = 0u; channel_select(ch);
             }
-
-            if (safe)
+            else if ((c == (uint8)'B') || (c == (uint8)'b'))
             {
-                uint16 code;
-
-                refresh_due    = false;
-                refresh_defers = 0u;
-
-                acquisition_run(&acq);
-
-                /* System supervision: a dead/stalled ADC or a sagging
-                 * VDDEXT both make readings untrustworthy while the probes
-                 * still AGREE (the disagreement check can't catch either).
-                 * Tracked per-cause so the wire reports WHICH one. On
-                 * VDDEXT instability, attempt a re-enable — recovers a
-                 * latched-off regulator, not just a sag.                   */
-                if (acq.stalled) { fault_raise_adc(); }
-                else             { fault_clear_adc(); }
-
-                if (vddext_stable() || PMU_VDDEXT_On())
-                {
-                    fault_clear_vddext();
-                }
-                else
-                {
-                    fault_raise_vddext();
-                }
-
-                /* Fault check — disagreement only means something with two
-                 * probes.                                                  */
-                if (nvm_config_get_probe_mode() == PROBE_MODE_DUAL)
-                {
-                    fault_check(acq.probe_a, acq.probe_b);
-                }
-                else
-                {
-                    fault_clear();   /* single probe: clear latched fault  */
-                }
-
-                /* Calibration capture accumulator — pause while a fault is
-                 * active so a corrupted reading can't average into a point */
-                if (!fault_is_active())
-                {
-                    cal_state_t before = calibration_get_state();
-                    calibration_service(acq.combined);
-                    if (before == CAL_CAPTURING &&
-                        calibration_get_state() == CAL_ARMED)
-                    {
-                        uart_send_str("Captured (");
-                        uart_send_u16(calibration_get_num_points());
-                        uart_send_str(" pts)\r\n");
-                    }
-                }
-
-                /* Link code — priority ladder (one code per packet; the
-                 * bench console can list all causes). Uncalibrated sends a
-                 * status code, NEVER raw counts dressed up as pressure.    */
-                if      (fault_adc_active())      { code = (uint16)LINK_CODE_ADC_STALL; }
-                else if (fault_vddext_active())   { code = (uint16)LINK_CODE_VDDEXT; }
-                else if (fault_disagree_active()) { code = (uint16)LINK_CODE_DISAGREE; }
-                else if (calibration_is_valid())
-                {
-                    code = link_encode_bar(calibration_apply(acq.combined));
-                }
-                else                              { code = (uint16)LINK_CODE_UNCAL; }
-                link_tx_set_live_code(code);
-
-                if (fenced) { link_tx_release(); }
-
-                /* AUTO stream last, so the line reflects THIS cycle's
-                 * state (debug console, unlocked sessions only).           */
-                uart_cmd_update_readings(acq.probe_a, acq.probe_b, acq.combined);
+                ch = ADC_CH_PROBE_B; ch_bit = 1u; channel_select(ch);
+            }
+            else if ((c == (uint8)'T') || (c == (uint8)'t'))
+            {
+                burst_run(ch);
             }
             else
             {
-                refresh_defers++;
+                /* unknown byte: ignore                                       */
             }
         }
 
-        /* — Cooperative background tasks -------------------------------- *
-         * Link first: it owns the tightest deadline on the wire.          */
-        link_tx_service();
-        led_arbitrate();
-        status_led_service();
-        uart_cmd_service();
+        if (convert(ch, &sample) == false)
+        {
+            continue;                              /* skip; next loop retries */
+        }
+
+        b0 = (uint8)(0x80u | ((uint32)ch_bit << 6) | (((uint32)seq & 3u) << 4)
+                     | ((sample >> 6) & 0x0Fu));
+        b1 = (uint8)(sample & 0x3Fu);
+        seq++;
+        tx_byte(b0);                               /* ~20 µs/sample: the wire */
+        tx_byte(b1);                               /* paces the whole loop    */
+
+        led_ctr++;
+        if (led_ctr >= ADC_SCOPE_LED_DIV)
+        {
+            led_ctr = 0u;
+            led_on  = !led_on;
+            if (led_on) { PORT_P04_Output_High_Set(); }
+            else        { PORT_P04_Output_Low_Set();  }
+        }
     }
 }

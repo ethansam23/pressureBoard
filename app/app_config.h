@@ -52,14 +52,22 @@
 
 /* ---- Downhole link (wire protocol constants live in link_frame.h) ------- */
 #ifndef LINK_CONSOLE_EN                 /* overridable from the Keil target    */
-#define LINK_CONSOLE_EN         1       /* 1 = debug build: bench console
-                                         * compiled in (boots LOCKED, unlock
-                                         * suspends the stream). 0 = PRODUCTION:
-                                         * console compiled out entirely —
-                                         * packets are the only possible
-                                         * bytes on the wire. Set via a -D
-                                         * define in the production target.   */
+#define LINK_CONSOLE_EN         0       /* exp/adc-scope BRANCH: forced 0 to
+                                         * free the 1 KB console TX ring for
+                                         * the burst buffer (this branch never
+                                         * runs the console or the packet
+                                         * stream). Mainline default is 1.    */
 #endif
+
+/* ---- exp/adc-scope experiment (BENCH ONLY — this branch never deploys) ---
+ * Raw single-conversion ADC stream on UART2/P1.0 at 1 Mbaud + RAM burst
+ * capture. The logger protocol is NOT on the wire on this branch.           */
+#define ADC_SCOPE_BAUD          1000000u /* exact at 40 MHz (80e6/80, 0.00%)  */
+#define ADC_SCOPE_BURST_N       1280u    /* uint16 samples = 2.56 KB of the
+                                          * 4 KB SRAM — re-check ZI after any
+                                          * change (512 B stack must fit too) */
+#define ADC_SCOPE_LED_DIV       25000u   /* stream samples per LED toggle:
+                                          * ~0.5 s at ~50 kS/s               */
 #define LINK_FENCE_TIMEOUT_MS   15u     /* fence: max wait for a safe idle
                                          * window (packet worst case 9.2 ms)  */
 #define LINK_CONSOLE_RELOCK_MS  300000u /* 5 min RX inactivity -> auto-relock */
