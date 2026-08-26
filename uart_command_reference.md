@@ -85,10 +85,53 @@ failed fence reports `NVM write failed` and leaves stored settings untouched.
 |---|---|
 | `LINKTEST <n>` | Force 16-bit code `n` (0–65535) onto the wire — **overrides live values AND fault codes**. RAM-only, **auto-expires after 5 min**. The stream is suspended while unlocked, so: set the code, then `CONSOLE LOCK` to actually transmit it |
 | `LINKTEST OFF` | Return the wire to live values |
+| `SIM BAR` | Drive the wire from the synthetic profile, bypassing the ADC and calibration. Index resets to 0 |
+| `SIM COUNTS` | Feed the profile in as synthetic ADC counts; the real calibration + encode path runs on the way out |
+| `SIM OFF` | Return to real acquisition |
+| `SIM PHASE A\|B\|FULL` | Pick the resolution sweep, one ladder cycle, or the whole 24 h run. Index resets to 0 |
+| `SIM SEEK <n>` | Jump to refresh index `n` (wraps at the phase length) |
+| `SIM STATUS` | Mode, phase, index/length, active RATE, current segment, current code |
 
 `STATUS` shows `TEST(!)` while an override is active. **Never deploy with
 LINKTEST active** — the 5-min expiry and the power-cycle reset are backstops,
 not the plan.
+
+### `SIM` — synthetic pressure source (bench builds only)
+
+Present only when the firmware is built with `-DAPP_ENABLE_SIM=1`. Substitutes
+the transducers so the link path can be verified in isolation from the ADC and
+the calibration math. `STATUS` shows `SIM(!)` while it is active.
+
+The profile has two phases (full detail in `verification_guide.md`):
+
+- **Phase A — resolution sweep, 20,600 s.** 0 → 10000 → 0 deci-bar at one code
+  per refresh, so every one of the 10,001 valid codes is transmitted once
+  ascending and once descending.
+- **Phase B — ramp-timing ladder, 3,600 s per cycle.** Five tiers of
+  fixed-duration ramp windows (5 min, 2 min, 1 min, 30 s, 10 s), four ramps
+  each, spanning 1 to 1000 dbar/refresh.
+- **`FULL`** = A + 18 × B + a 1,000 s stop = exactly 24 h.
+
+Points that bite if you skip them:
+
+- **Set it, then `CONSOLE LOCK`.** Packets are suspended while the console is
+  unlocked, exactly like `LINKTEST`.
+- **Window durations are wall-clock milliseconds, converted to refresh counts
+  against the *current* `RATE` on every refresh.** Do not change `RATE` while a
+  run is in progress: the profile length changes with it, so the current index
+  lands somewhere else entirely and the wire jumps. The reference stream you
+  are scoring against is generated for one `RATE` and is invalid after such a
+  change. (It is at least detectable — the verifier reports it as a divergence
+  at the moment of the change.) Set `RATE` first, then arm `SIM`.
+- **Unlike `LINKTEST` there is no auto-expiry.** A 24-hour soak has to keep
+  running. Sim state is RAM-only, so a reset returns the board to real
+  acquisition — which is also how a mid-soak reset becomes visible.
+- **Genuine ADC and excitation faults still win** in both modes, so a rig
+  problem can never be masked by synthetic data.
+- **`SIM COUNTS` is not exact and must not be verified as one.** One
+  12-bit-scaled count is ~2.4 dbar against the 0.1 dbar wire LSB, so the
+  profile's 1 dbar steps quantise into a staircase. Only `SIM BAR` is checked
+  value-exact.
 
 ### Calibration — values in **bar** (or append `PSI`)
 | Command | Description |
@@ -119,7 +162,8 @@ Faults: none
 Rate: 1000ms  Thresh: 80  NVM: ok
 Cal: VALID  slope=0.245 offset=-1.013
 ```
-- `Link:` the 16-bit code on (or pending for) the wire; `LIVE` or `TEST(!)`
+- `Link:` the 16-bit code on (or pending for) the wire; `LIVE` or `TEST(!)`,
+  plus `SIM(!)` when the synthetic source is driving
 - `mode=` `PKT` (streaming) or `CONSOLE (stream suspended)`
 - `Faults:` **all** active causes (`ADC_STALL` / `VDDEXT` / `DISAGREE`) — the
   wire carries only the highest-priority one
@@ -155,6 +199,7 @@ spec: `link_protocol.md`). Each packet carries one 16-bit code, selected in
 |---|---|
 | `LINKTEST` active | the forced code (overrides everything) |
 | ADC stalled | `0xFF04` ADC_STALL |
+| `SIM BAR` active | the profile code — but ADC_STALL and VDDEXT above still win |
 | VDDEXT unstable | `0xFF05` VDDEXT |
 | Probe disagreement | `0xFF03` DISAGREE |
 | Calibrated | pressure, 0.1 bar/LSB (`0`–`10000`); >1010 bar → `0xFF06` OVER_RANGE, <−5 bar → `0xFF07` UNDER_RANGE |
@@ -229,6 +274,13 @@ LINKTEST OFF      → back to live
 ---
 
 ## Changelog
+
+- **2026-08-26: `SIM` added (bench builds only).** Synthetic pressure profile
+  standing in for the transducers, for the 24 h link-path soak: a full-range
+  resolution sweep (all 10,001 codes) plus a fixed-duration ramp-timing ladder
+  (5 min down to 10 s windows, 1–1000 dbar/refresh). `SIM
+  OFF|BAR|COUNTS|PHASE|SEEK|STATUS`; `STATUS` gains a `SIM(!)` marker. Compiled
+  out entirely unless built with `-DAPP_ENABLE_SIM=1`; never persisted to NVM.
 
 - **2026-07-14: DIGITAL LINK REARCHITECTURE.** Analog PWM-DAC output (P0.1)
   removed entirely; the downhole interface is now a one-way 9600-baud packet

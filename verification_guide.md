@@ -241,6 +241,130 @@ with `AUTO` on + `RATE 100`, 10+ minutes:
 
 ---
 
+## Test 15 — Soak rig setup (do this before T-A…T-D)
+
+Firmware must be built with `-DAPP_ENABLE_SIM=1`. Wiring:
+
+```
+                    ┌────────────► logger RX          (the real recording)
+board TX P1.0 ──────┤
+                    └────────────► host USB-serial RX (passive tap / evidence)
+```
+
+The logger input is high-Z, so tapping in parallel is safe at 9600.
+
+- [ ] **External pull-up fitted on P1.0.** P1.0 is high-Z while the MCU is in
+      reset (`link_protocol.md` §1, gate Q17), so without it a reset presents
+      as floating noise rather than clean idle — corrupting exactly the
+      evidence these tests exist to collect
+- [ ] **J-Link DETACHED.** WDT1 is disabled in debug mode, so watchdog
+      regressions are invisible under the debugger
+- [ ] Board on a bench supply, not the logging PC's USB
+- [ ] Common ground between board, logger and tap
+- [ ] `CONSOLE UNLOCK` → `SIM STATUS` → confirm `rate=1000ms` and the resolved
+      step counts look sane, then `SIM BAR`, then **`CONSOLE LOCK`**
+- [ ] Host: `python soak_capture.py --port <COM> --out logs/<run>` — it must
+      print bytes accumulating within a few seconds
+
+> **Cleanup:** `SIM OFF` after every soak. Sim state is RAM-only so a power
+> cycle also clears it, but leaving it armed makes the next test lie.
+
+## Test A — Resolution / full range (Phase A, 5 h 43 m)
+
+Proves every deci-bar code the wire can carry actually encodes and transmits.
+`SIM PHASE A`, `SIM BAR`, `CONSOLE LOCK`, capture, then:
+
+```
+make -C host_tests
+./host_tests/test_link_frame --emit-ref ref_a.csv 1000 1
+python soak_verify.py --capture logs/<run> --reference ref_a.csv --rate 1000
+```
+
+- [ ] `distinct pressure codes seen : 10001` and `coverage : 100.0000%`
+- [ ] `checksum err : 0`, `non-frame bytes: 0`
+- [ ] `range seen : 0 .. 10000 dbar` — nothing above the cap
+- [ ] No divergence; `RESULT: PASS`
+- [ ] Codes seen: _____ / 10001   checksum errors: _____
+
+Coverage here is what covers the payload-sacred cases (every code whose LSB or
+checksum lands on `0x7F`) without a hand-picked vector list — Test 5 spot-checks
+four of them, this sweeps all of them.
+
+## Test B — Ramp timing ladder (Phase B, 1 h)
+
+Twenty fixed-duration ramps at rates from 1 to 1000 dbar/refresh.
+`SIM PHASE B`, `SIM BAR`, `CONSOLE LOCK`, capture one full cycle, then verify
+against `--emit-ref ref_b.csv 1000 2`.
+
+- [ ] All 20 ramps appear in the RAMP TIMING table
+- [ ] Every ramp `ok` — none `OUT OF TOLERANCE`
+- [ ] Worst |error|: _____ ms (tolerance is 80 ms or 2%, whichever is larger)
+- [ ] `RESULT: PASS`
+
+Durations are measured by counting packets against the 40 ms nominal period,
+not by host timestamps — OS serial buffering would otherwise dominate the
+error on the 10-second windows.
+
+## Test C — High-resolution stress (Phase B at RATE 100, 1 h)
+
+Same wall-clock ladder with 10× the samples per ramp: the value changes every
+2.5 packets instead of every 25.
+
+- [ ] `CONSOLE UNLOCK` → `RATE 100` → `SIM PHASE B` → `SIM BAR` → `CONSOLE LOCK`
+      (set `RATE` **before** arming SIM: window durations are converted against
+      the current `RATE` on every refresh, so changing it mid-run moves the
+      index and makes the reference invalid)
+- [ ] Verify with `--emit-ref ref_b100.csv 100 2 … --rate 100`
+- [ ] `RESULT: PASS`; `aborts=0 skips=0` in `STATUS` afterwards
+- [ ] Restore `RATE 1000` before Test D
+
+## Test D — 24-hour endurance (FULL, 24 h)
+
+The real run: 2,160,000 packets, ~8.6 MB at the tap.
+`RATE 1000`, `SIM PHASE FULL`, `SIM BAR`, `CONSOLE LOCK`, capture 24 h.
+
+- [ ] `RESULT: PASS` against `--emit-ref ref_full.csv 1000 0`
+- [ ] `coverage : 100.0000%` (Phase A runs first, so all 10,001 codes)
+- [ ] **No unexpected `NO_READING` onsets.** The profile emits one per cycle
+      by design (19 in a full run); anything beyond that is a board reset
+- [ ] All 362 ramps within tolerance
+- [ ] `checksum err : 0` over the whole run
+- [ ] No silence beyond the 75 ms worst legitimate gap
+- [ ] `aborts=0 skips=0` in `STATUS` afterwards
+- [ ] Packets received: _____ / 2,160,000   resets: _____   worst gap: _____ ms
+- [ ] Logger's own recording compared against the tap: _____
+
+> **Do not change `RATE`, `THRESH`, `RANGE`, `PROBE` or run `CAL STORE` during
+> the run.** Each writes NVM (30k cycle endurance), and `RATE` would rescale
+> the ladder and invalidate the reference.
+
+## Test E — Encoder edges and real fault generation
+
+Tests A–D prove the status codes reach the logger correctly. This proves the
+board *generates* the right one. Provoke each at its real source and check the
+wire:
+
+| Cause | Expected code | How to provoke |
+|---|---|---|
+| ADC stalled | `0xFF04` ADC_STALL | starve conversions |
+| Excitation down | `0xFF05` VDDEXT | collapse the VDDEXT rail |
+| Probe disagreement | `0xFF03` DISAGREE | drive the probes apart past `THRESH` |
+| No calibration | `0xFF02` UNCAL | `CAL CLEAR` |
+| Boot | `0xFF01` NO_READING | cold power-up |
+
+- [ ] Each cause produces its own code on the wire
+- [ ] **Priority ladder**: provoke ADC stall *and* disagreement together →
+      only `0xFF04` appears (`ADC_STALL > VDDEXT > DISAGREE > UNCAL`)
+- [ ] With `SIM BAR` armed, provoke an ADC stall → the wire shows `0xFF04`,
+      **not** the synthetic value (synthetic data must never mask a rig fault)
+- [ ] `OVER_RANGE` (`0xFF06`) above 10100 dbar and `UNDER_RANGE` (`0xFF07`)
+      below −50 dbar — these are *encoder* edges outside the profile's range,
+      so drive them with `LINKTEST`/calibration rather than `SIM`
+- [ ] Clamp band: 10000–10100 dbar encodes to exactly `10000`, **not**
+      `OVER_RANGE`
+- [ ] Mid-run reset: power-cycle during a soak → capture shows the silence,
+      and `SIM` is **off** afterwards (state is never persisted)
+
 ## Results summary
 
 | Test | Description | Pass/Fail | Notes |
@@ -259,6 +383,12 @@ with `AUTO` on + `RATE 100`, 10+ minutes:
 | 12 | Watchdog soak | | |
 | 13 | Power readout + measurement | | |
 | 14 | LED patterns | | |
+| 15 | Soak rig setup (pull-up, J-Link off) | | |
+| A | Resolution / full range — all 10,001 codes | | |
+| B | Ramp timing ladder (20 ramps) | | |
+| C | High-resolution stress (RATE 100) | | |
+| D | 24-hour endurance (2.16M packets) | | |
+| E | Encoder edges + real fault generation | | |
 
 **Deployment sign-off additionally requires** the logger-designer
 questionnaire answers in `link_protocol.md` (staleness rule Q11 above all)
