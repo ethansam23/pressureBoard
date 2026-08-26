@@ -12,3 +12,8 @@ JLinkLog.txt
 # Python
 __pycache__/
 *.pyc
+
+# Soak captures — a 24 h run is ~8.6 MB of raw wire bytes per part
+host_ui/logs/
+*.bin
+*.idx
