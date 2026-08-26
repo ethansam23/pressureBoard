@@ -419,6 +419,23 @@ static uint16 parse_u16(const char *s)
     return (uint16)v;
 }
 
+#if APP_ENABLE_SIM
+/* SIM SEEK indices exceed 16 bits (a full run is 86,400 refreshes at RATE
+ * 1000, and 864,000 at RATE 100), so seeking needs its own accumulator.
+ * Saturates rather than wrapping, same contract as parse_u16.              */
+static uint32 parse_u32(const char *s)
+{
+    uint32 v = 0u;
+    while (*s >= '0' && *s <= '9')
+    {
+        if (v > (0xFFFFFFFFu - (uint32)(*s - '0')) / 10u) { return 0xFFFFFFFFu; }
+        v = v * 10u + (uint32)(*s - '0');
+        s++;
+    }
+    return v;
+}
+#endif
+
 /* Strictly digits, at least one — rejects "" , "abc", and "10O" (which
  * parse_u16 would silently read as 10). */
 static bool is_clean_u16(const char *s)
@@ -518,6 +535,9 @@ static void print_status(void)
 
     uart_send_str("Link: 0x");   uart_send_hex16(link_tx_get_live_code());
     uart_send_str(link_tx_is_test() ? "  TEST(!)" : "  LIVE");
+#if APP_ENABLE_SIM
+    if (link_tx_sim_mode() != SIM_MODE_OFF) { uart_send_str("  SIM(!)"); }
+#endif
     uart_send_str("  mode=");
     uart_send_str(link_tx_console_active() ? "CONSOLE (stream suspended)" : "PKT");
     uart_send_str("  pkts=");    uart_send_u32(link_tx_get_pkt_count());
@@ -650,6 +670,116 @@ static void process_cmd(const char *cmd)
             uart_send_str("ERR: LINKTEST <0-65535>|OFF\r\n");
         }
     }
+#if APP_ENABLE_SIM
+    else if (cmd_prefix(cmd, "SIM "))
+    {
+        const char *arg = cmd + 4;
+        if (cmd_eq(arg, "OFF"))
+        {
+            link_tx_sim_set(SIM_MODE_OFF, SIM_PHASE_FULL);
+            uart_send_str("Sim OFF — real acquisition resumes\r\n");
+        }
+        else if (cmd_eq(arg, "BAR") || cmd_eq(arg, "COUNTS"))
+        {
+            uint8 m = cmd_eq(arg, "BAR") ? (uint8)SIM_MODE_BAR
+                                         : (uint8)SIM_MODE_COUNTS;
+            link_tx_sim_set(m, link_tx_sim_phase());
+            uart_send_str("Sim ");
+            uart_send_str((m == (uint8)SIM_MODE_BAR) ? "BAR" : "COUNTS");
+            uart_send_str(" — SYNTHETIC pressure, index reset to 0\r\n");
+            if (m == (uint8)SIM_MODE_COUNTS && !calibration_is_valid())
+            {
+                uart_send_str("WARN: no valid cal — COUNTS cannot be back-solved, wire sends UNCAL\r\n");
+            }
+            uart_send_str("(stream is suspended while unlocked: CONSOLE LOCK to transmit it)\r\n");
+        }
+        else if (cmd_prefix(arg, "PHASE "))
+        {
+            const char *pa = arg + 6;
+            uint8 ph;
+            bool  ok = true;
+            if      (cmd_eq(pa, "A"))    { ph = (uint8)SIM_PHASE_A; }
+            else if (cmd_eq(pa, "B"))    { ph = (uint8)SIM_PHASE_B; }
+            else if (cmd_eq(pa, "FULL")) { ph = (uint8)SIM_PHASE_FULL; }
+            else                        { ph = 0u; ok = false; }
+            if (ok)
+            {
+                link_tx_sim_set(link_tx_sim_mode(), ph);
+                uart_send_str("Sim phase=");
+                uart_send_str(pa);
+                uart_send_str(", index reset to 0\r\n");
+            }
+            else
+            {
+                uart_send_str("ERR: SIM PHASE A|B|FULL\r\n");
+            }
+        }
+        else if (cmd_prefix(arg, "SEEK "))
+        {
+            const char *sk = arg + 5;
+            if (is_clean_u16(sk))    /* digits-only check; value is 32-bit */
+            {
+                uint32 want = parse_u32(sk);
+                uint32 len  = sim_profile_len(scheduler_get_rate_ms(),
+                                              link_tx_sim_phase());
+                link_tx_sim_seek((len != 0u) ? (want % len) : 0u);
+                uart_send_str("Sim index=");
+                uart_send_u32(link_tx_sim_index());
+                uart_send_str("\r\n");
+            }
+            else
+            {
+                uart_send_str("ERR: SIM SEEK <index>\r\n");
+            }
+        }
+        else if (cmd_eq(arg, "STATUS"))
+        {
+            uint32         rate  = scheduler_get_rate_ms();
+            uint8          ph    = link_tx_sim_phase();
+            uint32         idx   = link_tx_sim_index();
+            uint32         len   = sim_profile_len(rate, ph);
+            uint32         seg   = sim_profile_seg_at(idx, rate, ph);
+            sim_seg_info_t info;
+
+            uart_send_str("Sim: ");
+            switch (link_tx_sim_mode())
+            {
+            case SIM_MODE_BAR:    uart_send_str("BAR");    break;
+            case SIM_MODE_COUNTS: uart_send_str("COUNTS"); break;
+            default:              uart_send_str("OFF");    break;
+            }
+            uart_send_str("  phase=");
+            uart_send_str((ph == (uint8)SIM_PHASE_A) ? "A"
+                          : ((ph == (uint8)SIM_PHASE_B) ? "B" : "FULL"));
+            uart_send_str("  idx=");  uart_send_u32(idx);
+            uart_send_str("/");       uart_send_u32(len);
+            uart_send_str("  rate="); uart_send_u32(rate);
+            uart_send_str("ms\r\n");
+
+            if (sim_profile_seg_info(ph, seg, rate, &info))
+            {
+                uart_send_str("Seg ");   uart_send_u32(seg);
+                uart_send_str(" ");
+                uart_send_str((info.kind == (uint8)SIM_SEG_RAMP)   ? "RAMP"
+                              : ((info.kind == (uint8)SIM_SEG_HOLD) ? "HOLD"
+                                                                    : "STATUS"));
+                uart_send_str(" ");      uart_send_u16(info.start);
+                uart_send_str("->");     uart_send_u16(info.target);
+                uart_send_str(" dbar  first="); uart_send_u32(info.first);
+                uart_send_str(" steps=");       uart_send_u32(info.steps);
+                uart_send_str(" dur=");         uart_send_u32(info.dur_ms);
+                uart_send_str("ms\r\n");
+            }
+            uart_send_str("Code: 0x");
+            uart_send_hex16(sim_profile_code(idx, rate, ph));
+            uart_send_str("\r\n");
+        }
+        else
+        {
+            uart_send_str("ERR: SIM OFF|BAR|COUNTS|PHASE <p>|SEEK <n>|STATUS\r\n");
+        }
+    }
+#endif /* APP_ENABLE_SIM */
     else if (cmd_prefix(cmd, "THRESH "))
     {
         uint16 t = parse_u16(cmd + 7);
@@ -902,6 +1032,9 @@ static void process_cmd(const char *cmd)
         uart_send_str("  PROBE A|B|AVG   — probe source (NVM)\r\n");
         uart_send_str("  LINKTEST <n>|OFF— force a 16-bit wire code (5 min)\r\n");
         uart_send_str("  CONSOLE LOCK    — re-lock console, resume stream\r\n");
+#if APP_ENABLE_SIM
+        uart_send_str("  SIM <mode>      — synthetic pressure (SIM STATUS)\r\n");
+#endif
         uart_send_str("  POWER           — power consumption\r\n");
         uart_send_str("  CAL ARM         — start calibration\r\n");
         uart_send_str("  CAL <bar>       — capture at pressure (max 8 pts)\r\n");
@@ -918,6 +1051,9 @@ static void process_cmd(const char *cmd)
     else if (cmd_eq(cmd, "THRESH"))   { uart_send_str("ERR: THRESH <1-4092>\r\n"); }
     else if (cmd_eq(cmd, "PROBE"))    { uart_send_str("ERR: PROBE A|B|AVG\r\n"); }
     else if (cmd_eq(cmd, "LINKTEST")) { uart_send_str("ERR: LINKTEST <0-65535>|OFF\r\n"); }
+#if APP_ENABLE_SIM
+    else if (cmd_eq(cmd, "SIM"))      { uart_send_str("ERR: SIM OFF|BAR|COUNTS|PHASE <p>|SEEK <n>|STATUS\r\n"); }
+#endif
     else if (cmd_eq(cmd, "CONSOLE"))  { uart_send_str("ERR: CONSOLE LOCK|UNLOCK\r\n"); }
     else if (cmd_eq(cmd, "CAL"))      { uart_send_str("ERR: CAL <bar>[ PSI]|ARM|STORE|CLEAR|STATUS|ABORT\r\n"); }
     else if (cmd_eq(cmd, "PSI"))      { uart_send_str("ERR: PSI <value>\r\n"); }

@@ -1,6 +1,6 @@
 #include "link_tx.h"
+#include "app_config.h"   /* APP_ENABLE_SIM — must precede link_frame.h */
 #include "link_frame.h"
-#include "app_config.h"
 #include "scheduler.h"
 #include "uart_cmd.h"
 #include "uart.h"
@@ -46,6 +46,11 @@ static uint16 last_sent_code;
 static bool   test_on;
 static uint16 test_code;
 static uint32 test_t0;
+#if APP_ENABLE_SIM
+static uint8  sim_mode_v;          /* SIM_MODE_OFF / _BAR / _COUNTS          */
+static uint8  sim_phase_v;         /* SIM_PHASE_FULL / _A / _B               */
+static uint32 sim_index_v;         /* advances once per refresh              */
+#endif
 
 /* ========================================================================= */
 /*  Init                                                                     */
@@ -293,6 +298,22 @@ void link_tx_set_test(uint16 code)
 }
 void link_tx_clear_test(void) { test_on = false; }
 bool link_tx_is_test(void)    { return test_on; }
+
+#if APP_ENABLE_SIM
+void link_tx_sim_set(uint8 mode, uint8 phase)
+{
+    /* Restarting the profile on every mode change keeps a run's index origin
+     * unambiguous — the reference stream always starts at index 0.          */
+    sim_mode_v  = mode;
+    sim_phase_v = phase;
+    sim_index_v = 0u;
+}
+uint8  link_tx_sim_mode(void)     { return sim_mode_v; }
+uint8  link_tx_sim_phase(void)    { return sim_phase_v; }
+void   link_tx_sim_seek(uint32 i) { sim_index_v = i; }
+uint32 link_tx_sim_index(void)    { return sim_index_v; }
+void   link_tx_sim_advance(void)  { sim_index_v++; }
+#endif /* APP_ENABLE_SIM */
 
 uint32 link_tx_get_pkt_count(void) { return sm.pkts_ok; }
 

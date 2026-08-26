@@ -7,7 +7,7 @@
 #                 encode path is a specific concern — see link_encode_bar)
 
 CC      ?= cc
-CFLAGS   = -std=c11 -Wall -Wextra -Werror -I../app
+CFLAGS   = -std=c11 -Wall -Wextra -Werror -I../app -DAPP_ENABLE_SIM=1
 
 .PHONY: all run ubsan clean
 

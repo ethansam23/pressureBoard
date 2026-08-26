@@ -562,8 +562,257 @@ static void test_wraparound(void)
     CHECK(sm.aborts[LINK_ABT_BAD_STATE] == 0, "no wrap corruption");
 }
 
-int main(void)
+
+/* ==== Part 4: bench simulation profile ====================================
+ * The profile is the reference stream for the 24 h logging soak, so these
+ * tests ARE the contract: the host verifier compares captures against the
+ * very same sim_profile_code() compiled here.
+ * ========================================================================= */
+
+/* dbar/refresh for each of the 20 Phase B ramps at RATE 1000, in table order.
+ * Written out independently of link_frame.c so a table edit has to be a
+ * deliberate two-place change, not a silent one.                           */
+static const int32_t k_ladder_rates[20] = {
+    1,   5,   14,  -20,      /* tier 1 — 5 min windows  */
+    2,   8,   40,  -50,      /* tier 2 — 2 min windows  */
+    10,  40,  100, -150,     /* tier 3 — 1 min windows  */
+    20,  80,  200, -300,     /* tier 4 — 30 s windows   */
+    50,  250, 700, -1000     /* tier 5 — 10 s windows   */
+};
+
+static void test_sim_lengths(void)
 {
+    /* Durations are wall-clock, so refresh counts scale with RATE. */
+    CHECK(sim_profile_len(1000u, SIM_PHASE_A) == 20600u,
+          "phase A @1000 = %u, want 20600", sim_profile_len(1000u, SIM_PHASE_A));
+    CHECK(sim_profile_len(1000u, SIM_PHASE_B) == 3600u,
+          "phase B @1000 = %u, want 3600", sim_profile_len(1000u, SIM_PHASE_B));
+    CHECK(sim_profile_len(1000u, SIM_PHASE_FULL) == 86400u,
+          "FULL @1000 = %u, want 86400 (24 h)",
+          sim_profile_len(1000u, SIM_PHASE_FULL));
+
+    CHECK(sim_profile_len(100u, SIM_PHASE_A) == 206000u, "phase A @100");
+    CHECK(sim_profile_len(100u, SIM_PHASE_B) == 36000u,  "phase B @100");
+    CHECK(sim_profile_len(100u, SIM_PHASE_FULL) == 864000u, "FULL @100");
+
+    /* FULL must be exactly A + 18*B + the closing stop (1000 s). */
+    CHECK(sim_profile_len(1000u, SIM_PHASE_FULL)
+              == 20600u + 18u * 3600u + 1000u, "FULL composition");
+}
+
+/* Every valid code, once ascending and once descending — the resolution and
+ * full-range proof, and what covers the payload-sacred 0x7F images without a
+ * hand-written vector list.
+ *
+ * The no-duplicate contract belongs to the RAMP segments specifically: the
+ * holds either side legitimately repeat 0 and full scale, so a naive
+ * first-half/second-half split would (wrongly) score those as duplicates. */
+static void test_sim_phase_a_coverage(uint32_t rate)
+{
+    static uint8_t seen[10001];
+    uint32_t nseg = sim_profile_seg_count(SIM_PHASE_A);
+    uint32_t seg, i, ramps = 0u;
+    int miss_all = 0, bad = 0;
+    int seen_7f_lsb = 0, seen_7f_chk = 0;
+    uint32_t len = sim_profile_len(rate, SIM_PHASE_A);
+
+    memset(seen, 0, sizeof seen);
+
+    /* Whole-phase pass: total coverage and code-page legality. */
+    for (i = 0u; i < len; i++)
+    {
+        uint16_t c = sim_profile_code(i, rate, SIM_PHASE_A);
+        uint8_t  d[3];
+        if (c > LINK_VALUE_MAX)
+        {
+            if (c < LINK_CODE_NO_READING || c > LINK_CODE_UNDER_RANGE) { bad++; }
+            continue;
+        }
+        seen[c] = 1u;
+        link_build_data(c, d);
+        if (d[1] == LINK_SYNC_BYTE) { seen_7f_lsb++; }
+        if (d[2] == LINK_SYNC_BYTE) { seen_7f_chk++; }
+    }
+    for (i = 0u; i <= LINK_VALUE_MAX; i++) { if (!seen[i]) { miss_all++; } }
+
+    CHECK(bad == 0, "phase A @%u emitted %d out-of-page codes", rate, bad);
+    CHECK(miss_all == 0, "phase A @%u missed %d of the 10001 codes",
+          rate, miss_all);
+    CHECK(seen_7f_lsb > 0, "phase A never produced an LSB of 0x7F");
+    CHECK(seen_7f_chk > 0, "phase A never produced a checksum of 0x7F");
+
+    /* Per-ramp pass: each sweep must be strictly monotonic and, at the
+     * one-code-per-refresh rate, hit each code exactly once. */
+    for (seg = 0u; seg < nseg; seg++)
+    {
+        sim_seg_info_t sg;
+        uint32_t k;
+        int dups = 0;
+        uint16_t prev;
+        if (!sim_profile_seg_info(SIM_PHASE_A, seg, rate, &sg)) { continue; }
+        if (sg.kind != SIM_SEG_RAMP) { continue; }
+        ramps++;
+        memset(seen, 0, sizeof seen);
+        prev = sg.start;
+        for (k = 0u; k < sg.steps; k++)
+        {
+            uint16_t c = sim_profile_code(sg.first + k, rate, SIM_PHASE_A);
+            CHECK(c <= LINK_VALUE_MAX, "phase A ramp exceeded the cap: %u", c);
+            if (sg.target > sg.start) { CHECK(c >= prev, "phase A ramp up not monotonic"); }
+            else                      { CHECK(c <= prev, "phase A ramp down not monotonic"); }
+            if (seen[c]) { dups++; }
+            seen[c] = 1u;
+            prev = c;
+        }
+        CHECK(prev == sg.target, "phase A ramp ended at %u, target %u",
+              prev, sg.target);
+        if (rate == 1000u)
+        {
+            /* Exactly one code per refresh: 10000 steps, 10000 distinct codes. */
+            CHECK(dups == 0, "phase A ramp @1000 repeated %d codes", dups);
+            CHECK(sg.steps == 10000u, "phase A ramp @1000 has %u steps, want 10000",
+                  sg.steps);
+        }
+    }
+    CHECK(ramps == 2u, "phase A has %u ramps, expected 2 (up and down)", ramps);
+}
+
+/* Fixed-duration windows at varying rates — the timing-ladder contract. */
+static void test_sim_ladder(void)
+{
+    const uint32_t rate = 1000u;
+    uint32_t nseg = sim_profile_seg_count(SIM_PHASE_B);
+    uint32_t seg, ramp_i = 0u, holds = 0u, status = 0u, walked = 0u;
+
+    for (seg = 0u; seg < nseg; seg++)
+    {
+        sim_seg_info_t s;
+        uint32_t k;
+        if (!sim_profile_seg_info(SIM_PHASE_B, seg, rate, &s))
+        {
+            CHECK(0, "seg_info(%u) failed", seg);
+            return;
+        }
+        CHECK(s.first == walked, "seg %u starts at %u, expected %u",
+              seg, s.first, walked);
+        CHECK(s.steps == s.dur_ms / rate, "seg %u step count", seg);
+        walked += s.steps;
+
+        if (s.kind == SIM_SEG_STATUS)
+        {
+            status++;
+            /* Exactly the seven codes, in order, evenly spread. */
+            for (k = 0u; k < s.steps; k++)
+            {
+                uint16_t c = sim_profile_code(s.first + k, rate, SIM_PHASE_B);
+                uint16_t want = (uint16_t)(LINK_CODE_NO_READING
+                                           + (k * SIM_STATUS_CODES) / s.steps);
+                CHECK(c == want, "status seg step %u: got %04X want %04X",
+                      k, c, want);
+            }
+        }
+        else if (s.kind == SIM_SEG_HOLD)
+        {
+            holds++;
+            for (k = 0u; k < s.steps; k++)
+            {
+                uint16_t c = sim_profile_code(s.first + k, rate, SIM_PHASE_B);
+                CHECK(c == s.target, "hold seg %u step %u drifted: %u != %u",
+                      seg, k, c, s.target);
+            }
+        }
+        else /* RAMP */
+        {
+            int32_t  delta = (int32_t)s.target - (int32_t)s.start;
+            int32_t  rate_dbar;
+            int      up = (delta > 0);
+            uint16_t prev = s.start;
+
+            CHECK(ramp_i < 20u, "more than 20 ramps in the ladder");
+            /* Rates must be whole dbar/refresh at RATE 1000 — that is what
+             * makes the ladder's expected values trivially checkable.      */
+            CHECK((delta % (int32_t)s.steps) == 0,
+                  "ramp %u rate not integral at RATE 1000", ramp_i);
+            rate_dbar = delta / (int32_t)s.steps;
+            if (ramp_i < 20u)
+            {
+                CHECK(rate_dbar == k_ladder_rates[ramp_i],
+                      "ramp %u rate %d dbar/rf, expected %d",
+                      ramp_i, rate_dbar, k_ladder_rates[ramp_i]);
+            }
+            /* Monotonic, no overshoot, exact landing on the target. */
+            for (k = 0u; k < s.steps; k++)
+            {
+                uint16_t c = sim_profile_code(s.first + k, rate, SIM_PHASE_B);
+                CHECK(c <= LINK_VALUE_MAX, "ramp %u exceeded the cap: %u",
+                      ramp_i, c);
+                if (up) { CHECK(c >= prev, "ramp %u not monotonic up", ramp_i); }
+                else    { CHECK(c <= prev, "ramp %u not monotonic down", ramp_i); }
+                prev = c;
+            }
+            CHECK(prev == s.target, "ramp %u ended at %u, target %u",
+                  ramp_i, prev, s.target);
+            ramp_i++;
+        }
+    }
+    CHECK(ramp_i == 20u, "ladder has %u ramps, expected 20", ramp_i);
+    CHECK(status == 1u, "ladder has %u status blocks, expected 1", status);
+    CHECK(holds > 0u, "ladder has no holds");
+    CHECK(walked == sim_profile_len(rate, SIM_PHASE_B),
+          "segment walk (%u) != profile length (%u)",
+          walked, sim_profile_len(rate, SIM_PHASE_B));
+}
+
+/* Pure and wrap-seamless: the soak reference must be reproducible and the
+ * index must be free to run past the end of the profile. */
+static void test_sim_determinism_and_wrap(void)
+{
+    uint32_t len = sim_profile_len(1000u, SIM_PHASE_FULL);
+    uint32_t i;
+    for (i = 0u; i < 5000u; i++)
+    {
+        uint32_t idx = i * 17u;
+        uint16_t a = sim_profile_code(idx, 1000u, SIM_PHASE_FULL);
+        uint16_t b = sim_profile_code(idx, 1000u, SIM_PHASE_FULL);
+        uint16_t w = sim_profile_code(idx + len, 1000u, SIM_PHASE_FULL);
+        CHECK(a == b, "sim_profile_code not pure at %u", idx);
+        CHECK(a == w, "wrap discontinuity at %u", idx);
+    }
+    /* A degenerate RATE must not divide by zero or produce a zero length. */
+    CHECK(sim_profile_len(0u, SIM_PHASE_A) > 0u, "rate 0 guarded");
+    CHECK(sim_profile_len(5000u, SIM_PHASE_B) > 0u, "slow rate still valid");
+}
+
+/* Emit the reference stream the host verifier scores captures against. */
+static int emit_reference(const char *path, uint32_t rate, uint8_t phase)
+{
+    FILE *f = fopen(path, "w");
+    uint32_t len, i;
+    if (f == NULL) { printf("cannot write %s\n", path); return 1; }
+    len = sim_profile_len(rate, phase);
+    fprintf(f, "index,code,seg\n");
+    for (i = 0u; i < len; i++)
+    {
+        fprintf(f, "%u,%u,%u\n", i, sim_profile_code(i, rate, phase),
+                sim_profile_seg_at(i, rate, phase));
+    }
+    fclose(f);
+    printf("%s: %u rows (rate=%u ms, phase=%u)\n", path, len, rate, phase);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    /* Reference-stream generation for host_ui/soak_verify.py:
+     *   ./test_link_frame --emit-ref <file> <rate_ms> <phase 0=FULL,1=A,2=B>
+     * Generated from the SAME function the firmware runs, which is the whole
+     * reason the profile lives in the pure protocol core.                  */
+    if (argc >= 5 && strcmp(argv[1], "--emit-ref") == 0)
+    {
+        return emit_reference(argv[2], (uint32_t)strtoul(argv[3], NULL, 10),
+                              (uint8_t)strtoul(argv[4], NULL, 10));
+    }
+    (void)argc; (void)argv;
     test_checksum();
     test_build_and_golden();
     test_encode();
@@ -574,6 +823,11 @@ int main(void)
     test_sim_modes_and_latch();
     test_busy_skip_scripted();
     test_wraparound();
+    test_sim_lengths();
+    test_sim_phase_a_coverage(1000u);
+    test_sim_phase_a_coverage(100u);
+    test_sim_ladder();
+    test_sim_determinism_and_wrap();
     if (g_fail != 0)
     {
         printf("\n%d FAILURE(S)\n", g_fail);

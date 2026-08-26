@@ -65,6 +65,25 @@
 #define LINK_CONSOLE_RELOCK_MS  300000u /* 5 min RX inactivity -> auto-relock */
 #define LINKTEST_EXPIRY_MS      300000u /* forced test code auto-expiry       */
 
+/* ---- Bench simulation source (BENCH BUILDS ONLY) ------------------------ *
+ * Synthetic pressure profile standing in for the transducers, so the link
+ * path can be verified in isolation from the ADC and the calibration math.
+ * The profile itself lives in link_frame.c (pure/integer-only, so the host
+ * test harness generates its reference stream from the same code).
+ *
+ * MUST BE 0 IN PRODUCTION. At 0 the generator, the injection in main.c and
+ * the SIM command are all compiled out — no synthetic value can reach the
+ * wire. Driven from the compiler define rather than being edited here, so
+ * every translation unit (including link_frame.c, which does not include
+ * this file) agrees: set -DAPP_ENABLE_SIM=1 on the bench Keil target only.
+ *
+ * Sim state is deliberately NEVER persisted to NVM — a reset always returns
+ * the board to real acquisition, which also makes a mid-soak reset obvious
+ * instead of silently continuing to stream fake data.                       */
+#ifndef APP_ENABLE_SIM                  /* overridable from the Keil target    */
+#define APP_ENABLE_SIM          0
+#endif
+
 /* ---- Unit conversion ----------------------------------------------------- *
  * Firmware is bar-native; the bench gauge reads psi. UART accepts a "PSI"
  * suffix on CAL / RANGE values and offers PSI/BAR converter commands.       */

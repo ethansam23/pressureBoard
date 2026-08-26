@@ -42,6 +42,59 @@ static void led_arbitrate(void)
     if (desired != cur) { status_led_set_state(desired); }
 }
 
+#if APP_ENABLE_SIM
+/* Bench simulation source. Substitutes the transducers so the link path can
+ * be verified in isolation. Returns the profile's wire code for this refresh
+ * and advances the index.
+ *
+ * SIM_MODE_COUNTS back-solves the calibration so the wire follows the same
+ * recognisable profile while the REAL cal + encode maths runs on the way out.
+ * It is deliberately NOT an exact reproduction and must not be verified as
+ * one: counts are 12-bit-scaled over the configured window, so one count is
+ * ~2.4 dbar at a 0-1000 bar span — far coarser than the 0.1 dbar wire LSB.
+ * The profile's 1 dbar steps therefore quantise into a staircase. The host
+ * verifier scores COUNTS runs against a counts-quantised expectation with
+ * that tolerance; only SIM_MODE_BAR is checked value-exact.                */
+static uint16 sim_step_code(acq_result_t *a)
+{
+    uint32 idx   = link_tx_sim_index();
+    uint8  phase = link_tx_sim_phase();
+    uint16 code  = sim_profile_code(idx, scheduler_get_rate_ms(), phase);
+
+    link_tx_sim_advance();
+
+    if (link_tx_sim_mode() == SIM_MODE_COUNTS)
+    {
+        /* Status codes have no counts preimage — pass them straight through
+         * so the fault portion of the profile still exercises the wire.    */
+        if (code <= (uint16)LINK_VALUE_MAX)
+        {
+            float slope = calibration_get_slope();
+            if (calibration_is_valid() && (slope != 0.0f))
+            {
+                float counts = (((float)code / 10.0f) - calibration_get_offset())
+                               / slope;
+                uint16 c;
+                /* Round rather than truncate — halves the quantisation error
+                 * that the coarse count scale already forces on us.        */
+                counts += 0.5f;
+                if (counts < 0.0f)                  { counts = 0.0f; }
+                if (counts > (float)ADC_COUNTS_MAX) { counts = (float)ADC_COUNTS_MAX; }
+                c = (uint16)counts;
+                a->probe_a  = c;
+                a->probe_b  = c;
+                a->combined = c;
+                a->stalled  = false;
+            }
+            /* No valid calibration: leave acq alone. The ladder below then
+             * reports UNCAL, which is the honest answer — do not fabricate. */
+        }
+        return code;
+    }
+    return code;   /* SIM_MODE_BAR: injected at the ladder, acq untouched   */
+}
+#endif /* APP_ENABLE_SIM */
+
 int main(void)
 {
     /* ---- SDK init --------------------------------------------------------- *
@@ -133,6 +186,7 @@ int main(void)
             if (safe)
             {
                 uint16 code;
+                bool   laddered = true;   /* false = sim bypassed the ladder */
 
                 refresh_due    = false;
                 refresh_defers = 0u;
@@ -186,14 +240,36 @@ int main(void)
                 /* Link code — priority ladder (one code per packet; the
                  * bench console can list all causes). Uncalibrated sends a
                  * status code, NEVER raw counts dressed up as pressure.    */
-                if      (fault_adc_active())      { code = (uint16)LINK_CODE_ADC_STALL; }
-                else if (fault_vddext_active())   { code = (uint16)LINK_CODE_VDDEXT; }
-                else if (fault_disagree_active()) { code = (uint16)LINK_CODE_DISAGREE; }
-                else if (calibration_is_valid())
+#if APP_ENABLE_SIM
+                /* Bench sim runs BEFORE the ladder so SIM_MODE_COUNTS can
+                 * seed acq and still be scored by the real fault/cal path.
+                 * SIM_MODE_BAR bypasses the ladder — that is the point of it
+                 * (pure link-path isolation) — but genuine ADC and excitation
+                 * faults still win, so a rig problem can never be masked by
+                 * synthetic data.                                          */
+                if (link_tx_sim_mode() != SIM_MODE_OFF)
                 {
-                    code = link_encode_bar(calibration_apply(acq.combined));
+                    uint16 sim_code = sim_step_code(&acq);
+                    if (link_tx_sim_mode() == SIM_MODE_BAR)
+                    {
+                        if      (fault_adc_active())    { sim_code = (uint16)LINK_CODE_ADC_STALL; }
+                        else if (fault_vddext_active()) { sim_code = (uint16)LINK_CODE_VDDEXT; }
+                        code      = sim_code;
+                        laddered  = false;
+                    }
                 }
-                else                              { code = (uint16)LINK_CODE_UNCAL; }
+#endif
+                if (laddered)
+                {
+                    if      (fault_adc_active())      { code = (uint16)LINK_CODE_ADC_STALL; }
+                    else if (fault_vddext_active())   { code = (uint16)LINK_CODE_VDDEXT; }
+                    else if (fault_disagree_active()) { code = (uint16)LINK_CODE_DISAGREE; }
+                    else if (calibration_is_valid())
+                    {
+                        code = link_encode_bar(calibration_apply(acq.combined));
+                    }
+                    else                              { code = (uint16)LINK_CODE_UNCAL; }
+                }
                 link_tx_set_live_code(code);
 
                 if (fenced) { link_tx_release(); }

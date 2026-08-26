@@ -2,6 +2,7 @@
 #define LINK_TX_H
 
 #include "types.h"
+#include "app_config.h"   /* APP_ENABLE_SIM */
 
 /*******************************************************************************
  * Downhole link — UART2 hardware shim, TX owner arbiter, and NVM/refresh fence.
@@ -45,6 +46,29 @@ uint16 link_tx_get_last_code(void);    /* code of the last STARTED packet     */
 void   link_tx_set_test(uint16 code);
 void   link_tx_clear_test(void);
 bool   link_tx_is_test(void);
+
+#if APP_ENABLE_SIM
+/* ---- Bench simulation source (BENCH BUILDS ONLY) -------------------------
+ * Runtime state for the synthetic pressure profile. It lives here, beside the
+ * LINKTEST override, because it is the same category of thing: a bench-only
+ * substitution for what would otherwise reach the wire. The profile maths
+ * itself is pure and lives in link_frame.c.
+ *
+ * RAM-only and NEVER persisted — a reset always returns the board to real
+ * acquisition, which also makes a mid-soak reset obvious in the capture.
+ * Unlike LINKTEST there is no auto-expiry: a 24-hour soak has to keep
+ * running, and the console is locked throughout anyway.                     */
+#define SIM_MODE_OFF            0u
+#define SIM_MODE_BAR            1u   /* inject the wire code directly        */
+#define SIM_MODE_COUNTS         2u   /* inject ADC counts; real cal math runs */
+
+void    link_tx_sim_set(uint8 mode, uint8 phase);
+uint8   link_tx_sim_mode(void);
+uint8   link_tx_sim_phase(void);
+void    link_tx_sim_seek(uint32 index);
+uint32  link_tx_sim_index(void);
+void    link_tx_sim_advance(void);   /* main.c: once per refresh, after use  */
+#endif /* APP_ENABLE_SIM */
 
 /* Fence (fail-closed contract): true = hold acquired, wire idle, safe to
  * stall/mask IRQs; caller MUST link_tx_release() afterwards. false = could

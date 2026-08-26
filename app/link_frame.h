@@ -146,4 +146,93 @@ void link_sm_force_recovery(link_sm_t *sm, link_abort_t origin, uint32_t now);
  * window in which nothing else may touch the UART.                          */
 bool link_sm_in_packet(const link_sm_t *sm);
 
+/* ===========================================================================
+ *  Bench simulation profile — synthetic pressure source (BENCH BUILDS ONLY)
+ * ===========================================================================
+ * Stands in for the transducers so the link path can be verified in isolation
+ * from the ADC and the calibration math. Kept here, in the pure protocol core,
+ * for one reason: host_tests/ compiles this file under gcc, so the host's
+ * reference stream is produced by the EXACT function the firmware runs. No
+ * reimplementation, no soft-float divergence, no "did I mirror it correctly".
+ *
+ * Integer-only by construction — never introduce a float into this section.
+ *
+ * The profile has two phases (see verification_guide.md):
+ *
+ *   Phase A — resolution sweep, 20,600 s. Ramps 0 -> 10000 -> 0 deci-bar at
+ *             one code per refresh, so every one of the 10,001 valid codes is
+ *             transmitted once ascending and once descending. This is also
+ *             what covers the payload-sacred cases (every code whose LSB or
+ *             checksum lands on 0x7F) without a hand-picked vector list.
+ *
+ *   Phase B — ramp-timing ladder, 3,600 s per cycle, 18 cycles. Five tiers of
+ *             FIXED-DURATION ramp windows (5 min, 2 min, 1 min, 30 s, 10 s),
+ *             four ramps each at differing slew rates: 1..1000 dbar/refresh.
+ *
+ *   Full run = A + 18*B + a 1,000 s stop = 86,400,000 ms exactly (24 h).
+ *
+ * Segment durations are WALL-CLOCK MILLISECONDS, resolved to refresh counts
+ * against the active RATE. That is deliberate: the ladder measures durations,
+ * so a RATE change must not silently rescale the windows. Consequence — RATE
+ * must not change mid-run, and rate_ms > 1000 degrades Phase A's resolution
+ * (at RATE 5000 the sweep steps 5 dbar and skips codes). rate_ms <= 1000 gives
+ * full coverage; faster rates simply hold each code for more refreshes.
+ ******************************************************************************/
+
+/* Bench-only: compiled out entirely unless the build defines APP_ENABLE_SIM=1
+ * (Keil target define for bench builds; -DAPP_ENABLE_SIM=1 in host_tests).
+ * Driven from the compiler define rather than app_config.h so this file stays
+ * standalone-compilable, and so every translation unit agrees.              */
+#ifndef APP_ENABLE_SIM
+#define APP_ENABLE_SIM          0
+#endif
+
+#if APP_ENABLE_SIM
+
+/* Which portion of the profile to run. */
+#define SIM_PHASE_FULL          0u   /* A, then 18x B, then the closing stop  */
+#define SIM_PHASE_A             1u   /* resolution sweep alone                */
+#define SIM_PHASE_B             2u   /* one ladder cycle alone                */
+
+/* Segment kinds (sim_seg_info_t.kind). */
+#define SIM_SEG_STATUS          0u   /* walks LINK_CODE_NO_READING..UNDER_RANGE */
+#define SIM_SEG_RAMP            1u   /* linear interpolation to .target       */
+#define SIM_SEG_HOLD            2u   /* constant .target                      */
+
+#define SIM_STATUS_CODES        7u   /* FF01..FF07                            */
+#define SIM_PHASE_B_CYCLES      18u  /* ladder repeats in a full 24 h run     */
+
+/* One resolved segment, for STATUS reporting and for the host verifier's
+ * per-ramp duration checks. */
+typedef struct
+{
+    uint8_t  kind;
+    uint16_t start;      /* code at segment entry (RAMP start / HOLD value)   */
+    uint16_t target;     /* code at segment exit                              */
+    uint32_t first;      /* first refresh index belonging to this segment     */
+    uint32_t steps;      /* refresh count = dur_ms / rate_ms                  */
+    uint32_t dur_ms;     /* specified wall-clock duration                     */
+} sim_seg_info_t;
+
+/* The wire code for refresh `index` of `phase`, at the given refresh period.
+ * Pure: same inputs always give the same output. `index` beyond the profile
+ * length wraps. rate_ms of 0 is treated as 1 to stay total.                  */
+uint16_t sim_profile_code(uint32_t index, uint32_t rate_ms, uint8_t phase);
+
+/* Total refresh count of `phase` at `rate_ms` (the wrap period).             */
+uint32_t sim_profile_len(uint32_t rate_ms, uint8_t phase);
+
+/* Segment table introspection. seg is 0-based within the phase; for
+ * SIM_PHASE_FULL the Phase B cycle segments repeat, so `first` reflects the
+ * cycle given by seg / segments-per-cycle. Returns false when seg is out of
+ * range.                                                                     */
+uint32_t sim_profile_seg_count(uint8_t phase);
+bool     sim_profile_seg_info(uint8_t phase, uint32_t seg, uint32_t rate_ms,
+                              sim_seg_info_t *out);
+
+/* Index of the segment containing `index` (companion to seg_info).           */
+uint32_t sim_profile_seg_at(uint32_t index, uint32_t rate_ms, uint8_t phase);
+
+#endif /* APP_ENABLE_SIM */
+
 #endif /* LINK_FRAME_H */
