@@ -53,9 +53,16 @@ Everything downstream assumes these. Run them before touching the board.
 
 | Check | Command | Gate |
 |---|---|---|
-| Protocol core + profile | `make -C host_tests` | ALL TESTS PASSED |
+| Protocol core + profile | `make -C host_tests` | ALL TESTS PASSED + `refs/ up to date` |
 | Sanitisers | `make -C host_tests ubsan` | ALL TESTS PASSED |
 | Host tooling | `python -m unittest discover host_ui` | 32 tests OK |
+
+> **The two `make` lines need gcc, which the bench PC probably does not have.**
+> They are a developer gate, not a bench gate — run them wherever the firmware
+> is edited (WSL, MSYS2/MinGW, or CI). The bench needs **only Python**: the
+> reference streams are committed in `host_tests/refs/`, so no compiler sits
+> between you and a test run. `make` regenerates them into a temp directory and
+> fails on any difference, so they cannot silently drift from the code.
 | Production build | Keil, Production target | 0 warnings; confirm no sim code in the map file |
 | Bench build | Keil, Bench target | 0 warnings |
 | Autostart build | Keil, Bench-autostart target | 0 warnings |
@@ -103,11 +110,31 @@ amount of soak time will diagnose them without the scope.
 
 Before spending a day on a soak, prove the tooling can actually see a defect.
 
-| Step | What | Gate |
-|---|---|---|
-| 2.1 | Arm and capture 10 min: `soak_capture.py --port <COM> --out logs/smoke --arm --sim BAR --phase B` | Arming prints each step; preflight reports ~25 packets/s |
-| 2.2 | Verify against `--emit-ref ref_b.csv 1000 2` | `RESULT: PASS` |
-| 2.3 | **Test B** — one full ladder cycle (1 h) | All 20 ramps `ok`; worst \|error\| recorded |
+Needs only Python and the UART dongle — no compiler, no logger, no pressure
+source. From `host_ui/`:
+
+```
+pip install -r requirements.txt
+python -m serial.tools.list_ports -v          # find the board's COM port
+
+# 2.1 — arm the board and capture 10 minutes
+python soak_capture.py --port COM5 --out logs/smoke --arm --sim BAR --phase B
+
+# 2.2 — score it against the committed reference
+python soak_verify.py --capture logs/smoke ^
+       --reference ../host_tests/refs/phaseB_rate1000.csv --rate 1000
+
+# 2.3 — Test B: the same, run for a full 1 h ladder cycle
+python soak_capture.py --port COM5 --out logs/ladder --arm --sim BAR --phase B --hours 1
+python soak_verify.py --capture logs/ladder ^
+       --reference ../host_tests/refs/phaseB_rate1000.csv --rate 1000
+```
+
+| Step | Gate |
+|---|---|
+| 2.1 | Arming prints each step; preflight reports ~25 packets/s |
+| 2.2 | `RESULT: PASS` |
+| 2.3 | All 20 ramps `ok`; worst \|error\| recorded |
 
 **Record:** worst ramp timing error, in ms, across all 20 ramps and five window
 lengths (5 min down to 10 s).
