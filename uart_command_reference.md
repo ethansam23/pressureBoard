@@ -90,6 +90,37 @@ failed fence reports `NVM write failed` and leaves stored settings untouched.
 LINKTEST active** — the 5-min expiry and the power-cycle reset are backstops,
 not the plan.
 
+### Onboard NOR flash (IS25LP128F, 16 MB on SSC1)
+| Command | Description |
+|---|---|
+| `LOG STATUS` | Presence, raw JEDEC ID, status register, active SSC1 clock phase |
+| `LOG TEST` | Erase sector 0, write `0x55`×12 + `01 23 45 67`, read back and compare. **Destroys sector 0** |
+
+`LOG STATUS` prints the JEDEC ID whether or not it matched — that raw value is
+the diagnosis:
+
+| ID reads | Means |
+|---|---|
+| `9D 60 18` | Healthy IS25LP128F |
+| `00 00 00` or `FF FF FF` | The part never answered — wiring, the 3.3 V rail, or the level translators. Not a firmware problem |
+| anything else | Clock phase or bit alignment |
+
+If the line `NOTE: NOR_SSC1_PH in app_config.h is wrong` appears, `spi_nor_probe()`
+only got an answer after flipping the SSC1 clock phase. The `PH` bit's polarity
+is not documented in the local datasheet, so the driver tries both and reports
+which one worked — set `NOR_SSC1_PH` to the reported value and the fallback can
+be deleted.
+
+`LOG TEST` always prints what it read back, pass or fail, because *what* came
+back identifies the fault: shifted `0x55` (`AA`/`2A`/`D5`) is clock phase, a
+reversed `01 23 45 67` signature is bit order, correct `0x55` with a garbled
+signature is addressing. A post-erase "not blank" failure usually means `WP#`
+is held low.
+
+Both commands block — erase can take hundreds of ms — which is safe only
+because commands run in console mode with the stream suspended. The wait loops
+feed WDT1 and are hard-timeboxed.
+
 ### Calibration — values in **bar** (or append `PSI`)
 | Command | Description |
 |---|---|
@@ -111,11 +142,12 @@ active** so a corrupted reading can't enter a cal point.
 
 ## Output formats
 
-**`STATUS`** — five lines:
+**`STATUS`** — five lines, plus a sixth only if VDDEXT has ever tripped:
 ```
 ProbeA: 2048  ProbeB: 2052  Avg: 2050  Probe: AVG
 Link: 0x04D2  LIVE  mode=CONSOLE (stream suspended)  pkts=12345 aborts=0 skips=0
 Faults: none
+VDDEXT trips: 3  cause: UV
 Rate: 1000ms  Thresh: 80  NVM: ok
 Cal: VALID  slope=0.245 offset=-1.013
 ```
@@ -123,6 +155,13 @@ Cal: VALID  slope=0.245 offset=-1.013
 - `mode=` `PKT` (streaming) or `CONSOLE (stream suspended)`
 - `Faults:` **all** active causes (`ADC_STALL` / `VDDEXT` / `DISAGREE`) — the
   wire carries only the highest-priority one
+- `VDDEXT trips:` **omitted entirely when zero.** Count of latched excitation
+  shutdowns the recovery path found and cleared, sticky since boot (saturates
+  at 65535), with the sticky cause: `UV` (undervoltage — overload or VS sag)
+  and/or `OT` (overtemperature). A **recovered** rail leaves no other trace,
+  because restarting the regulator requires clearing the hardware latch that
+  recorded the reason — so a non-zero count with `Faults: none` means
+  excitation is flapping and the readings around each trip are suspect
 - `pkts/aborts/skips`: packets sent, aborts (any origin), busy-skips
 
 **`AUTO`** — one line per refresh; tag = `TST`/`FLT`/`CAL`/`UNC`:

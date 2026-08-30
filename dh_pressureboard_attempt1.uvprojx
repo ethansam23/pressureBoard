@@ -503,6 +503,11 @@
               <FileType>1</FileType>
               <FilePath>.\app\nvm_config.c</FilePath>
             </File>
+            <File>
+              <FileName>spi_nor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\spi_nor.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

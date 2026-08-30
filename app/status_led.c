@@ -8,18 +8,22 @@ static uint32      last_ms;
 static uint8       phase;       /* sub-step within a pattern                 */
 static bool        led_on;
 
-/* ---- helpers ------------------------------------------------------------ */
+/* ---- helpers ------------------------------------------------------------ *
+ * The LED lives on P1.4 (pin 34) — moved off P0.4 on the NOR-flash spin,
+ * where P0.4 became SSC1_M_MTSR (flash SI). The SDK exposes one inline
+ * function per pin, so the port is named literally here rather than derived
+ * from PIN_LED_STATUS; keep the two in step if the pin ever moves again.    */
 static void led_set(bool on)
 {
-    if (on) { PORT_P04_Output_High_Set(); }
-    else    { PORT_P04_Output_Low_Set();  }
+    if (on) { PORT_P14_Output_High_Set(); }
+    else    { PORT_P14_Output_Low_Set();  }
     led_on = on;
 }
 
 /* ---- public ------------------------------------------------------------- */
 void status_led_init(void)
 {
-    PORT_P04_Output_Set();          /* configure P0.4 as push-pull output    */
+    PORT_P14_Output_Set();          /* configure P1.4 as push-pull output    */
     led_set(false);
     state   = LED_STATE_HEARTBEAT;
     last_ms = 0u;

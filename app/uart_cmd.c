@@ -7,6 +7,7 @@
 #include "nvm_config.h"
 #include "fault.h"
 #include "acquisition.h"
+#include "spi_nor.h"
 #include "uart.h"
 #include "port.h"
 #include "wdt1.h"
@@ -535,6 +536,22 @@ static void print_status(void)
     }
     uart_send_str("\r\n");
 
+    /* VDDEXT trip history — sticky since boot, printed only when the rail has
+     * actually latched off at least once. A recovered rail leaves no other
+     * trace (the recovery path must clear the hardware latch to restart it),
+     * so this is the only way to see that excitation is flapping.           */
+    if (fault_get_vddext_cause() != 0u)
+    {
+        uint8 cause = fault_get_vddext_cause();
+
+        uart_send_str("VDDEXT trips: ");
+        uart_send_u16(fault_get_vddext_trips());
+        uart_send_str("  cause:");
+        if ((cause & (uint8)VDDEXT_CAUSE_UV) != 0u) { uart_send_str(" UV"); }
+        if ((cause & (uint8)VDDEXT_CAUSE_OT) != 0u) { uart_send_str(" OT"); }
+        uart_send_str("\r\n");
+    }
+
     uart_send_str("Rate: ");       uart_send_u16((uint16)scheduler_get_rate_ms());
     uart_send_str("ms  Thresh: "); uart_send_u16(nvm_config_get_disagree_thresh());
     uart_send_str("  NVM: ");      uart_send_str(nvm_flash_is_healthy() ? "ok" : "INCONSISTENT");
@@ -599,11 +616,382 @@ static void print_scan(void)
     }
 }
 
+/* Two hex digits — uart_send_hex16 would pad JEDEC bytes to "009D". */
+static void send_hex8(uint8 v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    uart_putc((uint8)hex[(v >> 4) & 0xFu]);
+    uart_putc((uint8)hex[v & 0xFu]);
+}
+
+/* Onboard NOR flash state. The raw ID is printed whether or not it matched:
+ * 9D 60 18 is a healthy IS25LP128F, while all-00 or all-FF means the part
+ * never answered — wiring, power, or the 3.3 V translators, not firmware. */
+static void print_log_status(void)
+{
+    uint8 id[3];
+
+    /* Re-probe if the boot-time attempt found nothing. main.c probes within
+     * a few ms of reset, which can beat the flash's own power-up timing —
+     * that would otherwise read as a dead part until the next reset. Cheap
+     * (~32 µs) and only happens while already absent.                      */
+    if (!spi_nor_present())
+    {
+        (void)spi_nor_probe();
+    }
+
+    spi_nor_get_id(id);
+
+    uart_send_str("NOR: ");
+    uart_send_str(spi_nor_present() ? "IS25LP128F 16MB" : "ABSENT");
+    uart_send_str("  id=");
+    send_hex8(id[0]); uart_send_str(" ");
+    send_hex8(id[1]); uart_send_str(" ");
+    send_hex8(id[2]);
+
+    if (spi_nor_present())
+    {
+        uart_send_str("  sr=0x");
+        send_hex8(spi_nor_read_status());
+    }
+
+    uart_send_str("  ph=");
+    uart_send_u16((uint16)spi_nor_phase_used());
+    uart_send_str("\r\n");
+
+    if (spi_nor_phase_was_flipped())
+    {
+        /* The SSC PH bit is undocumented locally, so probe() tries both.
+         * If the fallback is what answered, app_config.h is wrong — say so
+         * loudly rather than quietly running on the fallback forever.      */
+        uart_send_str("  NOTE: set NOR_SSC1_PH=");
+        uart_send_u16((uint16)spi_nor_phase_used());
+        uart_send_str(" and drop the fallback\r\n");
+    }
+    else if (!spi_nor_present())
+    {
+        /* Which failure it is decides where to look next, so say so rather
+         * than offering a generic checklist.                               */
+        if (spi_nor_bus_timed_out())
+        {
+            uart_send_str("  BUS DEAD: SSC1 cfg (mine)\r\n");
+        }
+        else
+        {
+            uart_send_str("  BUS OK, LINE QUIET\r\n");
+        }
+    }
+}
+
+/* Erase / program / read-back round trip on sector 0.
+ *
+ * Pattern choice matters here. 0x55 (01010101) is the right primary probe:
+ * a clock-phase or bit-alignment error shifts it into 0xAA / 0x2A / 0xD5
+ * rather than into something that still looks like data. But 0x55 repeated
+ * is blind to MSB-vs-LSB-first and to address ordering — every byte is
+ * identical and the pattern is its own mirror. So the last four bytes carry
+ * an asymmetric signature (01 23 45 67) that only reads back correctly if
+ * bit order AND byte order are both right.
+ *
+ * The read-back is always printed, pass or fail: WHAT came back is the
+ * diagnosis. All-FF = never answered (wiring/power). Shifted 0x55 = clock
+ * phase. Reversed signature = bit order. Correct 0x55 with a garbled
+ * signature = addressing.                                                  */
+static void print_log_test(void)
+{
+    uint8  want[NOR_TEST_LEN];
+    uint8  got[NOR_TEST_LEN];
+    uint8  i;
+    uint16 bad = 0u;
+
+    if (!spi_nor_present())
+    {
+        uart_send_str("LOG TEST: no flash (run LOG STATUS)\r\n");
+        return;
+    }
+
+    for (i = 0u; i < (uint8)NOR_TEST_LEN; i++) { want[i] = 0x55u; }
+    want[NOR_TEST_LEN - 4u] = 0x01u;
+    want[NOR_TEST_LEN - 3u] = 0x23u;
+    want[NOR_TEST_LEN - 2u] = 0x45u;
+    want[NOR_TEST_LEN - 1u] = 0x67u;
+
+    uart_send_str("LOG TEST: erasing sector 0...\r\n");
+    if (!spi_nor_erase_sector((uint32)NOR_TEST_ADDR))
+    {
+        uart_send_str("  FAIL: erase timed out (WIP never cleared)\r\n");
+        return;
+    }
+
+    /* An erased NOR sector reads all-ones. If it does not, the erase was
+     * accepted but did nothing — usually a missing write-enable or a WP#
+     * pin held low.                                                        */
+    if (!spi_nor_read((uint32)NOR_TEST_ADDR, got, (uint16)NOR_TEST_LEN))
+    {
+        uart_send_str("  FAIL: read after erase\r\n");
+        return;
+    }
+    for (i = 0u; i < (uint8)NOR_TEST_LEN; i++)
+    {
+        if (got[i] != 0xFFu) { bad++; }
+    }
+    if (bad != 0u)
+    {
+        uart_send_str("  FAIL: not blank (");
+        uart_send_u16(bad);
+        uart_send_str(" bytes) — check WP# is high\r\n");
+        return;
+    }
+
+    uart_send_str("  writing 0x55 x12 + 01 23 45 67...\r\n");
+    if (!spi_nor_write_page((uint32)NOR_TEST_ADDR, want, (uint16)NOR_TEST_LEN))
+    {
+        uart_send_str("  FAIL: program timed out\r\n");
+        return;
+    }
+
+    if (!spi_nor_read((uint32)NOR_TEST_ADDR, got, (uint16)NOR_TEST_LEN))
+    {
+        uart_send_str("  FAIL: read back\r\n");
+        return;
+    }
+
+    uart_send_str("  read: ");
+    for (i = 0u; i < (uint8)NOR_TEST_LEN; i++)
+    {
+        send_hex8(got[i]);
+        uart_send_str(" ");
+    }
+    uart_send_str("\r\n");
+
+    bad = 0u;
+    for (i = 0u; i < (uint8)NOR_TEST_LEN; i++)
+    {
+        if (got[i] != want[i]) { bad++; }
+    }
+
+    if (bad == 0u)
+    {
+        uart_send_str("  PASS — erase, program and read all agree\r\n");
+    }
+    else
+    {
+        uart_send_str("  FAIL: ");
+        uart_send_u16(bad);
+        uart_send_str("/");
+        uart_send_u16((uint16)NOR_TEST_LEN);
+        uart_send_str(" bytes differ\r\n");
+    }
+}
+
+/* True while LOG HOLD has the bus parked as GPIO. Normal SPI is suspended
+ * until LOG HOLD OFF restores it.                                          */
+static bool diag_parked;
+
+/* Hold for `ms`, feeding WDT1. Only ever called from LOG PINS, where the
+ * whole point is to stay at a DC level long enough to measure.             */
+static void diag_hold_ms(uint32 ms)
+{
+    uint32 t0 = scheduler_get_ms();
+    while ((scheduler_get_ms() - t0) < ms)
+    {
+        (void)WDT1_Service();
+    }
+}
+
+/* Drive one signal low for a beat, then high, announcing each so a DMM can
+ * be walked along. Measured AT THE FLASH PIN, this proves the whole path —
+ * MCU pad, series parts, translator, and the trace — which is exactly what
+ * "the shifter ran" cannot tell you.                                       */
+static void diag_pin(const char *label, uint8 sig)
+{
+    uart_send_str("  ");
+    uart_send_str(label);
+    uart_send_str(" LOW ...");
+    spi_nor_diag_set(sig, false);
+    diag_hold_ms((uint32)NOR_DIAG_HOLD_MS);
+
+    uart_send_str(" HIGH (expect ~3.3 V after the translator)\r\n");
+    spi_nor_diag_set(sig, true);
+    diag_hold_ms((uint32)NOR_DIAG_HOLD_MS);
+}
+
+static void print_log_pins(void)
+{
+    uint8 so_up, so_dn;
+
+    uart_send_str("LOG PINS: meter at FLASH pins\r\n");
+spi_nor_diag_begin();
+
+    /* SO first and without touching anything else: this is the one test that
+     * says whether the part is alive, and it needs no probe at all.        */
+    so_up = spi_nor_diag_so(false);
+    so_dn = spi_nor_diag_so(true);
+
+    uart_send_str("  SO (P0.5 <- flash SO): pull-up reads ");
+    uart_send_u16((uint16)so_up);
+    uart_send_str(", pull-down reads ");
+    uart_send_u16((uint16)so_dn);
+    uart_send_str("\r\n");
+
+    /* Three distinct states, not two. A floating pin FOLLOWS the pull; a
+     * driven pin overrides it. Branching on the pull-down alone reports a
+     * held-low line as "floating", which points at the wrong fault.        */
+    if ((so_up != 0u) && (so_dn != 0u))
+    {
+        uart_send_str("    -> DRIVEN HIGH\r\n");
+    }
+    else if ((so_up == 0u) && (so_dn == 0u))
+    {
+        uart_send_str("    -> DRIVEN LOW\r\n");
+    }
+    else if ((so_up != 0u) && (so_dn == 0u))
+    {
+        uart_send_str("    -> FLOATING\r\n");
+    }
+    else
+    {
+        uart_send_str("    -> INCONSISTENT\r\n");
+    }
+
+    diag_pin("CE# (P1.2 -> flash pin 1)", (uint8)NOR_SIG_CE);
+    diag_pin("SCK (P0.3 -> flash pin 6)", (uint8)NOR_SIG_SCK);
+    diag_pin("SI  (P0.4 -> flash pin 5)", (uint8)NOR_SIG_SI);
+
+    spi_nor_diag_end();
+    (void)spi_nor_probe();
+
+    uart_send_str("  restored\r\n");
+}
+
 static void process_cmd(const char *cmd)
 {
     if (cmd_eq(cmd, "STATUS"))
     {
         print_status();
+    }
+    else if (cmd_eq(cmd, "LOG STATUS"))
+    {
+        print_log_status();
+    }
+    else if (cmd_eq(cmd, "LOG LOOP"))
+    {
+        uint8 got[4];
+        bool  ok = spi_nor_loopback(got);
+        uint8 i;
+
+        uart_send_str("LOG LOOP: sent 55 AA 01 80 -> got ");
+        for (i = 0u; i < 4u; i++) { send_hex8(got[i]); uart_send_str(" "); }
+        uart_send_str("\r\n");
+
+        if (ok)
+        {
+            uart_send_str("  PASS: SSC1 ok -> fault is EXTERNAL\r\n");
+        }
+        else
+        {
+            uart_send_str("  FAIL: SSC1 cfg (mine)\r\n");
+        }
+    }
+    else if (cmd_eq(cmd, "LOG REGS"))
+    {
+        /* Read the pad configuration straight back off the chip. P0.4 (SI)
+         * works and P0.3 (SCK) does not, through identical code — so the
+         * two pins must differ in a register somewhere. Compare bit 3
+         * against bit 4 in each P0 word below and the difference is the
+         * bug.                                                            */
+        uart_send_str("P0_DIR    0x"); uart_send_hex16((uint16)PORT->P0_DIR.reg);
+        uart_send_str("  (bit3=SCK bit4=SI bit5=SO; 1=output)\r\n");
+        uart_send_str("P0_ALTSEL0 0x"); uart_send_hex16((uint16)PORT->P0_ALTSEL0.reg);
+        uart_send_str("  ALTSEL1 0x");  uart_send_hex16((uint16)PORT->P0_ALTSEL1.reg);
+        uart_send_str("  (00=GPIO, 01=ALT1)\r\n");
+        uart_send_str("P0_PUDEN  0x"); uart_send_hex16((uint16)PORT->P0_PUDEN.reg);
+        uart_send_str("  PUDSEL 0x");  uart_send_hex16((uint16)PORT->P0_PUDSEL.reg);
+        uart_send_str("  (pull enable / 1=up)\r\n");
+        uart_send_str("P0_DATA   0x"); uart_send_hex16((uint16)PORT->P0_DATA.reg);
+        uart_send_str("\r\n");
+        uart_send_str("P1_DIR    0x"); uart_send_hex16((uint16)PORT->P1_DIR.reg);
+        uart_send_str("  P1_DATA 0x"); uart_send_hex16((uint16)PORT->P1_DATA.reg);
+        uart_send_str("  (bit2=CE# bit4=LED)\r\n");
+        uart_send_str("SSC1_CON  0x"); uart_send_hex16((uint16)(SSC1->CON.reg >> 16));
+        uart_send_hex16((uint16)(SSC1->CON.reg & 0xFFFFu));
+        uart_send_str("  BR 0x");      uart_send_hex16((uint16)SSC1->BR.reg);
+        uart_send_str("  PISEL 0x");   uart_send_hex16((uint16)SSC1->PISEL.reg);
+        uart_send_str("\r\n");
+    }
+    else if (cmd_prefix(cmd, "LOG HOLD "))
+    {
+        /* Static hold: park one signal at one level and LEAVE it there, so
+         * the meter can be read at leisure instead of racing a 2 s window.
+         * The bus stays parked as GPIO until LOG HOLD OFF, so normal SPI is
+         * suspended meanwhile — that is deliberate and is stated below.   */
+        const char *arg = cmd + 9;
+        uint8 sig  = 0xFFu;
+        bool  lvl  = false;
+        bool  okarg = true;
+
+        if      (cmd_eq(arg, "OFF"))   { sig = 0xFEu; }
+        else if (cmd_eq(arg, "CE 0"))  { sig = (uint8)NOR_SIG_CE;  lvl = false; }
+        else if (cmd_eq(arg, "CE 1"))  { sig = (uint8)NOR_SIG_CE;  lvl = true;  }
+        else if (cmd_eq(arg, "SCK 0")) { sig = (uint8)NOR_SIG_SCK; lvl = false; }
+        else if (cmd_eq(arg, "SCK 1")) { sig = (uint8)NOR_SIG_SCK; lvl = true;  }
+        else if (cmd_eq(arg, "SI 0"))  { sig = (uint8)NOR_SIG_SI;  lvl = false; }
+        else if (cmd_eq(arg, "SI 1"))  { sig = (uint8)NOR_SIG_SI;  lvl = true;  }
+        else                           { okarg = false; }
+
+        if (!okarg)
+        {
+            uart_send_str("ERR: LOG HOLD CE|SCK|SI 0|1  (or OFF)\r\n");
+        }
+        else if (sig == 0xFEu)
+        {
+            spi_nor_diag_end();
+            (void)spi_nor_probe();
+            uart_send_str("Hold released; SSC1 restored and re-probed.\r\n");
+            diag_parked = false;
+        }
+        else
+        {
+            if (!diag_parked) { spi_nor_diag_begin(); diag_parked = true; }
+            spi_nor_diag_set(sig, lvl);
+            uart_send_str("Hold ");
+            uart_send_str(arg);
+            uart_send_str(" held; LOG HOLD OFF to free\r\n");
+        }
+    }
+    else if (cmd_eq(cmd, "LOG BB"))
+    {
+        uint8 id[3];
+        bool  ok = spi_nor_bitbang_id(id);
+        uint8 i;
+
+        uart_send_str("LOG BB (no SSC1/mux) -> ");
+        for (i = 0u; i < 3u; i++) { send_hex8(id[i]); uart_send_str(" "); }
+        uart_send_str("\r\n");
+
+        if (ok)
+        {
+            uart_send_str("  PASS: board ok -> SSC1 mux/PISEL (mine)\r\n");
+        }
+        else
+        {
+            uart_send_str("  FAIL: board (CE#/SCK/SI/xlator/flash)\r\n");
+        }
+
+        (void)spi_nor_probe();
+    }
+    else if (cmd_eq(cmd, "LOG PINS"))
+    {
+        /* Long-running by design (~12 s of DC holds). Console mode only, so
+         * the stream is suspended; the holds feed WDT1.                    */
+        print_log_pins();
+    }
+    else if (cmd_eq(cmd, "LOG TEST"))
+    {
+        /* Blocking: erase can take hundreds of ms. Safe here for the same
+         * reason RAW's ~34 ms burst is — commands only run in console mode,
+         * where the stream is suspended. The wait loops feed WDT1.        */
+        print_log_test();
     }
     else if (cmd_eq(cmd, "RAW"))
     {
@@ -897,6 +1285,7 @@ static void process_cmd(const char *cmd)
         uart_send_str("  RAW             — one burst: avg/min/max/mV/valid per ch\r\n");
         uart_send_str("  SCAN            — sweep all analog inputs (find live pin)\r\n");
         uart_send_str("  AUTO            — toggle auto-print\r\n");
+        uart_send_str("  LOG STATUS      — onboard NOR flash state\r\n");
         uart_send_str("  RATE <ms>       — set refresh rate (NVM)\r\n");
         uart_send_str("  THRESH <cnt>    — disagree threshold (NVM)\r\n");
         uart_send_str("  PROBE A|B|AVG   — probe source (NVM)\r\n");
@@ -919,6 +1308,7 @@ static void process_cmd(const char *cmd)
     else if (cmd_eq(cmd, "PROBE"))    { uart_send_str("ERR: PROBE A|B|AVG\r\n"); }
     else if (cmd_eq(cmd, "LINKTEST")) { uart_send_str("ERR: LINKTEST <0-65535>|OFF\r\n"); }
     else if (cmd_eq(cmd, "CONSOLE"))  { uart_send_str("ERR: CONSOLE LOCK|UNLOCK\r\n"); }
+    else if (cmd_eq(cmd, "LOG"))      { uart_send_str("ERR: LOG STATUS|TEST|PINS|LOOP|BB|HOLD\r\n"); }
     else if (cmd_eq(cmd, "CAL"))      { uart_send_str("ERR: CAL <bar>[ PSI]|ARM|STORE|CLEAR|STATUS|ABORT\r\n"); }
     else if (cmd_eq(cmd, "PSI"))      { uart_send_str("ERR: PSI <value>\r\n"); }
     else if (cmd_eq(cmd, "BAR"))      { uart_send_str("ERR: BAR <value>\r\n"); }

@@ -12,3 +12,6 @@ JLinkLog.txt
 # Python
 __pycache__/
 *.pyc
+
+# Bench captures from host_ui
+host_ui/burst_*.npy
