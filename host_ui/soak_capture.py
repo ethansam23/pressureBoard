@@ -32,6 +32,7 @@ Usage:
 """
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -87,6 +88,111 @@ class Capture:
             self.idx.close()
 
 
+class Armer:
+    """Opt-in arming: the ONLY code path in this tool that may transmit.
+
+    Without --arm the tool is physically incapable of writing to the port.
+    With it, arming runs once, then `done` latches and nothing transmits again
+    for the life of the capture.
+
+    Why this exists: arming otherwise means driving the GUI or a terminal,
+    closing it (COM ports are exclusive on Windows), then starting the capture
+    — and forgetting the final CONSOLE LOCK leaves the stream suspended, which
+    silently burns an entire unattended run.
+    """
+
+    def __init__(self, ser, sim, phase, expect_rate):
+        self.ser = ser
+        self.sim = sim
+        self.phase = phase
+        self.expect_rate = expect_rate
+        self.done = False
+
+    def _round_trip(self, cmd, settle=0.6):
+        self.ser.reset_input_buffer()
+        self.ser.write((cmd + "\r\n").encode("ascii"))
+        self.ser.flush()
+        # 9600 baud is slow and the board answers at its own super-loop pace;
+        # one command per loop pass, so give each a generous settle.
+        end = time.monotonic() + settle
+        buf = b""
+        while time.monotonic() < end:
+            buf += self.ser.read(256)
+        return buf.decode("ascii", "replace")
+
+    def run(self):
+        print("arming (this is the only time this tool transmits):")
+
+        reply = self._round_trip("CONSOLE UNLOCK", 1.0)
+        if "UNLOCK" not in reply.upper() and "unlocked" not in reply:
+            print("  ! CONSOLE UNLOCK got no recognisable reply:")
+            print("    %r" % reply[:200])
+            print("    Is this a production build (console compiled out), or")
+            print("    is the adapter TX wired to P1.1?")
+            return False
+        print("  console unlocked (packet stream suspended)")
+
+        for cmd in ("SIM PHASE %s" % self.phase, "SIM %s" % self.sim):
+            reply = self._round_trip(cmd)
+            if "ERR" in reply or "Sim" not in reply:
+                print("  ! %r rejected: %r" % (cmd, reply.strip()[:200]))
+                print("    Is the firmware built with -DAPP_ENABLE_SIM=1?")
+                return False
+            print("  %-18s ok" % cmd)
+
+        status = self._round_trip("SIM STATUS")
+        m = re.search(r"rate=(\d+)ms", status)
+        if not m:
+            print("  ! SIM STATUS did not report a rate: %r" % status.strip()[:200])
+            return False
+        rate = int(m.group(1))
+        if rate != self.expect_rate:
+            # A wrong RATE silently invalidates the reference stream, so this
+            # is worth failing before a long run rather than after it.
+            print("  ! board RATE is %d ms, expected %d" % (rate, self.expect_rate))
+            print("    The reference stream is generated for one RATE. Set the")
+            print("    board's RATE to match (or pass --expect-rate) and retry.")
+            print("    NOT setting it here on purpose: RATE writes NVM.")
+            return False
+        print("  rate               %d ms (matches --expect-rate)" % rate)
+
+        self._round_trip("CONSOLE LOCK", 1.0)
+        print("  console locked (packet stream resuming)")
+        self.done = True                 # latch: no further transmission, ever
+        return True
+
+
+def confirm_stream(ser, seconds=6.0):
+    """Decode a few seconds and require real packets before a long capture.
+
+    Turns the classic own-goal — a suspended stream, or the wrong baud, and 24
+    hours of silence — into an error inside ten seconds."""
+    try:
+        from link_decoder import LinkDecoder
+    except ImportError:
+        print("preflight skipped (link_decoder.py not importable)")
+        return True
+    dec = LinkDecoder()
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        data = ser.read(256)
+        if data:
+            dec.feed(data)
+    rate = dec.frames_ok / seconds
+    print("preflight: %d valid packet(s) in %.0f s (~%.1f/s, nominal 25)"
+          % (dec.frames_ok, seconds, rate))
+    if dec.frames_ok == 0:
+        print("  ! no valid packets. Either the console is still unlocked (the")
+        print("    stream is suspended while it is), the baud is wrong, or the")
+        print("    tap is not on P1.0.")
+        return False
+    if dec.checksum_errors:
+        print("  ! %d checksum error(s) already — check the tap wiring before"
+              % dec.checksum_errors)
+        print("    committing to a long run.")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -97,6 +203,17 @@ def main():
                     help="stop after N hours (default: run until interrupted)")
     ap.add_argument("--quiet-warn", type=float, default=2.0,
                     help="warn after this many seconds with no bytes")
+    ap.add_argument("--arm", action="store_true",
+                    help="arm the board before capturing (the ONLY thing that "
+                         "makes this tool transmit; it goes silent afterwards)")
+    ap.add_argument("--sim", default="BAR", choices=["BAR", "COUNTS", "OFF"],
+                    help="--arm: injection depth (default BAR)")
+    ap.add_argument("--phase", default="FULL", choices=["A", "B", "FULL"],
+                    help="--arm: profile phase (default FULL)")
+    ap.add_argument("--expect-rate", type=int, default=1000,
+                    help="--arm: abort unless the board reports this RATE. The "
+                         "reference stream is generated for one rate; a "
+                         "mismatch invalidates it (default 1000)")
     args = ap.parse_args()
 
     deadline = None if args.hours is None else time.monotonic() + args.hours * 3600.0
@@ -110,7 +227,30 @@ def main():
 
     print("capturing %s @ %d 8N1 -> %s.NNN.bin   (Ctrl-C to stop)"
           % (args.port, args.baud, args.out))
-    print("NOTE: this tool never transmits; keep the console LOCKED.")
+    if args.arm:
+        print("NOTE: --arm given; this tool transmits ONCE to arm, then never "
+              "again.")
+    else:
+        print("NOTE: this tool never transmits; keep the console LOCKED.")
+
+    # ---- arming + preflight, before a single byte is recorded -------------
+    if args.arm:
+        try:
+            armer_ser = serial.Serial(args.port, args.baud, timeout=0.2)
+        except Exception as e:                                   # noqa: BLE001
+            sys.exit("cannot open %s to arm: %s" % (args.port, e))
+        try:
+            ok = Armer(armer_ser, args.sim, args.phase,
+                       args.expect_rate).run()
+            if ok:
+                ok = confirm_stream(armer_ser)
+        finally:
+            armer_ser.close()
+        if not ok:
+            sys.exit("arming failed — not starting a capture that would record "
+                     "nothing useful.")
+        print("armed; starting capture.\n")
+
     try:
         while deadline is None or time.monotonic() < deadline:
             # --- (re)connect ------------------------------------------------

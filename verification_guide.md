@@ -7,12 +7,35 @@ mode, so watchdog regressions are invisible under the debugger.
 Equipment:
 - TLE9854QXW board, powered (5 V)
 - USB-UART adapter on TX P1.0 / RX P1.1 — **9600 8N1** (this line IS the
-  logger line; the console shares it under mutual exclusion)
+  logger line; the console shares it under mutual exclusion). **The adapter
+  must signal at 5 V** — see the pin table below
 - **Oscilloscope or logic analyzer on P1.0** — mandatory, not optional: it is
   the only instrument that can verify the wire timing the logger depends on
 - Host monitor (`host_ui/pressure_monitor.py`) — passive packet decoder +
   bench console
 - Reference pressure source + gauge (calibration tests)
+
+### Pins and levels
+
+| Signal | Pin | Package | Notes |
+|---|---|---|---|
+| **Link TX** (board → logger / adapter RX) | **P1.0** | 31 | UART2 TXD, ALT3, push-pull |
+| **Console RX** (adapter TX → board) | **P1.1** | 32 | UART2 RXD, input + firmware pull-up |
+| Status LED | P0.4 | 28 | |
+| Probe A / Probe B | P2.7 (AN7) / P2.3 (AN3) | 37 / 38 | ADC1 ch 12 / ch 9 |
+| Sensor excitation | VDDEXT | 45 | 5.0 V, 40 mA |
+
+Port pins run from **VDDP = 5.0 V**, and the two numbers that matter are:
+
+- P1.0 drives **V_OH ≥ 4.6 V** push-pull (datasheet Table 39). Into an adapter
+  RX that is not 5 V-tolerant, **the board can damage the adapter.** This is
+  the leg to get right.
+- P1.1 needs **V_IH ≥ 0.7 × VDDP = 3.5 V**. A 3.3 V adapter TX sits in the
+  undefined band — it is not a guaranteed logic high, and it fights the
+  firmware's 5 V pull-up. Not destructive (well inside the VDDP + 0.3 V
+  absolute max), but console commands may be flaky or dead.
+
+Use a 5 V adapter, or a level shifter. Both legs are fine at 9600.
 
 Record **nominal and worst observed** values for every timing measurement.
 
@@ -241,17 +264,21 @@ with `AUTO` on + `RATE 100`, 10+ minutes:
 
 ---
 
-## Test 15 — Soak rig setup (do this before T-A…T-D)
+## Test 15a — Adapter-only rig (do this FIRST — no logger needed)
 
-Firmware must be built with `-DAPP_ENABLE_SIM=1`. Wiring:
+**The entire T-A…T-D campaign runs here.** The logger is not a prerequisite for
+any of it: the tap is the complete board-side proof — does the firmware emit
+the right codes, with the right timing, for 24 hours. The logger answers a
+different question, covered in 15b.
+
+Firmware built with `-DAPP_ENABLE_SIM=1`. One USB-UART adapter does both jobs,
+since TX and RX are separate pins:
 
 ```
-                    ┌────────────► logger RX          (the real recording)
-board TX P1.0 ──────┤
-                    └────────────► host USB-serial RX (passive tap / evidence)
+board TX P1.0 ──────► adapter RX      (the packet stream)
+board RX P1.1 ◄────── adapter TX      (console commands)
+                GND ── common
 ```
-
-The logger input is high-Z, so tapping in parallel is safe at 9600.
 
 - [ ] **External pull-up fitted on P1.0.** P1.0 is high-Z while the MCU is in
       reset (`link_protocol.md` §1, gate Q17), so without it a reset presents
@@ -259,15 +286,76 @@ The logger input is high-Z, so tapping in parallel is safe at 9600.
       evidence these tests exist to collect
 - [ ] **J-Link DETACHED.** WDT1 is disabled in debug mode, so watchdog
       regressions are invisible under the debugger
-- [ ] Board on a bench supply, not the logging PC's USB
-- [ ] Common ground between board, logger and tap
-- [ ] `CONSOLE UNLOCK` → `SIM STATUS` → confirm `rate=1000ms` and the resolved
-      step counts look sane, then `SIM BAR`, then **`CONSOLE LOCK`**
-- [ ] Host: `python soak_capture.py --port <COM> --out logs/<run>` — it must
-      print bytes accumulating within a few seconds
+- [ ] Board on a bench supply, not the host PC's USB
+- [ ] Adapter signals at **5 V** (see Pins and levels above)
+- [ ] Arm and capture in one step:
+      `python soak_capture.py --port <COM> --out logs/<run> --arm --sim BAR --phase FULL`
+      — it prints the arming steps, verifies the board's RATE, then confirms
+      packets are actually flowing before committing to the long run
+- [ ] Or arm by hand: `CONSOLE UNLOCK` → `SIM STATUS` (sanity-check `rate=`) →
+      `SIM BAR` → **`CONSOLE LOCK`**, close the terminal, then start the
+      capture without `--arm`
 
 > **Cleanup:** `SIM OFF` after every soak. Sim state is RAM-only so a power
 > cycle also clears it, but leaving it armed makes the next test lie.
+
+## Test 15b — Add the logger (later, and only after 15a passes)
+
+Logger RX joins P1.0 in parallel — its input is high-Z, so tapping is safe.
+This answers only whether the **logger** records correctly, and feeds the
+`link_protocol.md` gates (Q7 rate, Q11 staleness, Q18/Q19).
+
+```
+                    ┌────────────► logger RX          (the real recording)
+board TX P1.0 ──────┤
+                    └────────────► adapter RX         (tap / independent evidence)
+```
+
+**Keep the tap, but remove one wire.** Electrically the parallel tap is a
+non-issue: two high-Z receivers add ~5–10 pF plus cable against a push-pull
+driver at a 104 µs bit time. The risk is the **TX** leg — with the adapter TX
+still on P1.1, anything that writes to that COM port can send `CONSOLE UNLOCK`
+and suspend the stream mid-run, leaving the logger recording silence. (The
+5-minute auto-relock caps it, but a five-minute hole still ruins the run.)
+
+- [ ] Flash the **autostart** build (`-DAPP_ENABLE_SIM=1 -DAPP_SIM_AUTOSTART=1`)
+- [ ] **Disconnect the adapter's TX wire.** Keep RX + ground only. Autostart
+      needs no console, so the tap becomes physically incapable of interfering
+- [ ] All three grounds tied together (bench supply, logger, host PC)
+- [ ] Do **not** leave the adapter plugged into an unpowered board — its TX
+      idles high at 5 V and can back-feed through P1.1's ESD diode into VDDP.
+      Power the board first; unplug the adapter before powering down
+- [ ] Start the capture, **then** press reset. The verifier can align anywhere,
+      but starting at index 0 makes alignment unambiguous and captures the
+      whole run
+- [ ] Compare the logger's own dump against the tap capture — if they disagree,
+      that difference is the finding
+
+### The start beacon (autostart builds)
+
+Autostart emits **30 s of full scale (10000 = 1000.0 bar)** before the profile
+begins, so the start of a run is unmissable in the logger's dump. It is
+boot-only, which makes it the reset detector: exactly one beacon per boot, so a
+second one anywhere in a capture means the board rebooted, and `soak_verify.py`
+reports it timestamped to the packet.
+
+Boot-to-first-pressure timeline at `RATE 1000`, so a healthy board is not
+mistaken for a dead one:
+
+| From reset | Wire shows |
+|---|---|
+| ~0 ms | `NO_READING` — the stream is alive within milliseconds |
+| ~1 s – 31 s | **beacon: `10000`, full scale** |
+| 31 s – 66 s | status block `FF01`…`FF07` |
+| 66 s – 126 s | held at 0 dbar |
+| from ~126 s | the Phase A sweep starts climbing, 1 dbar/s |
+
+**Reset signatures differ by build — know which you flashed:**
+
+| Build | On reset the wire shows |
+|---|---|
+| Console-armed (`APP_SIM_AUTOSTART=0`) | sim drops out entirely; `UNCAL` forever after, profile never resumes |
+| Autostart (`=1`) | a second start beacon, then the profile again from index 0 |
 
 ## Test A — Resolution / full range (Phase A, 5 h 43 m)
 
@@ -325,14 +413,17 @@ The real run: 2,160,000 packets, ~8.6 MB at the tap.
 
 - [ ] `RESULT: PASS` against `--emit-ref ref_full.csv 1000 0`
 - [ ] `coverage : 100.0000%` (Phase A runs first, so all 10,001 codes)
-- [ ] **No unexpected `NO_READING` onsets.** The profile emits one per cycle
-      by design (19 in a full run); anything beyond that is a board reset
+- [ ] **`resets : none`.** On an autostart build this is the start-beacon
+      check — exactly one beacon per run, so a second means the board rebooted.
+      On a console-armed build the verifier falls back to counting
+      `NO_READING` onsets (the profile emits one per cycle by design, 19 in a
+      full run) and flags the surplus
 - [ ] All 362 ramps within tolerance
 - [ ] `checksum err : 0` over the whole run
 - [ ] No silence beyond the 75 ms worst legitimate gap
 - [ ] `aborts=0 skips=0` in `STATUS` afterwards
 - [ ] Packets received: _____ / 2,160,000   resets: _____   worst gap: _____ ms
-- [ ] Logger's own recording compared against the tap: _____
+- [ ] Logger's own recording compared against the tap: _____ (15b only)
 
 > **Do not change `RATE`, `THRESH`, `RANGE`, `PROBE` or run `CAL STORE` during
 > the run.** Each writes NVM (30k cycle endurance), and `RATE` would rescale
@@ -383,7 +474,8 @@ wire:
 | 12 | Watchdog soak | | |
 | 13 | Power readout + measurement | | |
 | 14 | LED patterns | | |
-| 15 | Soak rig setup (pull-up, J-Link off) | | |
+| 15a | Adapter-only rig (pull-up, J-Link off) | | |
+| 15b | Logger added in parallel (TX wire removed) | | |
 | A | Resolution / full range — all 10,001 codes | | |
 | B | Ramp timing ladder (20 ramps) | | |
 | C | High-resolution stress (RATE 100) | | |

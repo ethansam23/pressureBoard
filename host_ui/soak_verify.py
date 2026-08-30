@@ -44,6 +44,7 @@ from link_decoder import LinkDecoder, decode_code, CODE_NAMES, VALUE_MAX  # noqa
 PACKET_PERIOD_MS = 40.0     # link_protocol.md §4 — nominal, rebased per sync
 WORST_GAP_MS = 75.0         # one fenced stalled-ADC refresh
 NO_READING = 0xFF01
+BEACON_CODE = VALUE_MAX     # app_config.h SIM_AUTOSTART_BEACON_CODE
 
 
 # --------------------------------------------------------------------------
@@ -105,6 +106,21 @@ def runs_of(codes):
             out[-1][1] += 1
         else:
             out.append([c, 1, pos])
+    return out
+
+
+def find_beacons(dec_runs):
+    """Run indices that are an autostart START BEACON.
+
+    The beacon is full scale held for ~30 s before the profile begins. The
+    profile ALSO holds at full scale (300 s in Phase A, briefly in tier 5), so
+    the value alone is not enough. What identifies a beacon is that it is
+    immediately followed by the profile's status block (NO_READING) — an
+    adjacency that occurs nowhere inside the profile itself."""
+    out = []
+    for i in range(len(dec_runs) - 1):
+        if dec_runs[i][0] == BEACON_CODE and dec_runs[i + 1][0] == NO_READING:
+            out.append(i)
     return out
 
 
@@ -219,6 +235,12 @@ def main():
     seen = set(c for c in codes if c <= VALUE_MAX)
     ref_vals = set(c for _, c, _ in ref if c <= VALUE_MAX)
     missing = sorted(ref_vals - seen)
+    # Runs and beacons are needed by the reset logic below as well as by
+    # alignment, so build them once here.
+    dec_runs_all = runs_of(codes)
+    ref_runs = runs_of([c for _, c, _ in ref])
+    beacons = find_beacons(dec_runs_all)
+
     print("\n-- RESOLUTION / FULL RANGE " + "-" * 45)
     print("distinct pressure codes seen : %d" % len(seen))
     print("codes the reference expects  : %d" % len(ref_vals))
@@ -265,14 +287,46 @@ def main():
           "profile's status block(s)" % (seen_nr, expect_nr))
     # Allow one extra: a capture may legitimately start mid-boot.
     resets = int(excess) if excess > 1.0 else 0
-    if resets:
+    if beacons:
+        # The beacon is direct evidence of a reboot; this count is an
+        # inference from the same event and would double-report it.
+        print("  (reset detection is by start beacon below — this count is "
+              "informational)")
+    elif resets:
         problems.append("%d unexpected NO_READING onset(s) — board reset "
                         "mid-run" % resets)
         print("  UNEXPECTED onsets            : %d   <-- BOARD RESET" % resets)
 
     # ---- alignment + value-exact comparison ------------------------------
-    dec_runs = runs_of(codes)
-    ref_runs = runs_of([c for _, c, _ in ref])
+    # ---- start beacon ----------------------------------------------------
+    print("\n-- START BEACON " + "-" * 56)
+    if not beacons:
+        print("none seen — console-armed build, or the capture began after the")
+        print("beacon had already passed. Resets fall back to NO_READING onsets.")
+        preamble = 0
+    else:
+        # Everything up to and including the first beacon is pre-run preamble
+        # (boot NO_READING, then the beacon). Alignment starts after it, so
+        # the reference stream stays exactly the profile.
+        preamble = beacons[0] + 1
+        b = dec_runs_all[beacons[0]]
+        print("run start    : packet %d, %d packets at full scale (~%.0f s)"
+              % (b[2], b[1], b[1] * PACKET_PERIOD_MS / 1000.0))
+        if len(beacons) > 1:
+            # Boot-only, so any further beacon is a board reset. This is direct
+            # evidence, unlike inferring one from NO_READING onsets.
+            problems.append("%d board reset(s) — a second start beacon means "
+                            "the board rebooted mid-run" % (len(beacons) - 1))
+            print("BOARD RESET  : %d further beacon(s) — the board rebooted "
+                  "mid-run" % (len(beacons) - 1))
+            for i in beacons[1:]:
+                print("               reset at packet %d (~%.1f s in)"
+                      % (dec_runs_all[i][2],
+                         dec_runs_all[i][2] * PACKET_PERIOD_MS / 1000.0))
+        else:
+            print("resets       : none (exactly one beacon, as expected)")
+
+    dec_runs = dec_runs_all[preamble:]
     off, skip = align(dec_runs, ref_runs)
     print("\n-- VALUE-EXACT COMPARISON " + "-" * 46)
     if off is None:

@@ -63,6 +63,18 @@ bool   link_tx_is_test(void);
 #define SIM_MODE_COUNTS         2u   /* inject ADC counts; real cal math runs */
 
 void    link_tx_sim_set(uint8 mode, uint8 phase);
+
+/* Autostart arming: same as link_tx_sim_set, plus a boot-only START BEACON of
+ * `beacon_refreshes` refreshes emitted before the profile's first sample.
+ *
+ * The beacon marks the start of a run unmissably in the logger's own dump,
+ * and because it is boot-only it doubles as the reset detector: exactly one
+ * per boot, so a second one in a capture is a reset. link_tx_sim_set() (the
+ * console path) deliberately sets no beacon — at the bench you already know
+ * when you started, and the T-A/T-B reference streams do not include one.  */
+void    link_tx_sim_autostart(uint8 mode, uint8 phase, uint32 beacon_refreshes);
+uint32  link_tx_sim_beacon_left(void);
+void    link_tx_sim_beacon_tick(void);   /* consume one beacon refresh       */
 uint8   link_tx_sim_mode(void);
 uint8   link_tx_sim_phase(void);
 void    link_tx_sim_seek(uint32 index);

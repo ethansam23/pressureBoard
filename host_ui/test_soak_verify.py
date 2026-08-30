@@ -37,25 +37,51 @@ def emit_reference(path, rate=RATE_MS, phase=2):
     return rows
 
 
-def synth(rows, prefix, defect=None, at=None):
-    """Write a wire capture for `rows`, optionally with one injected defect."""
+BEACON_CODE = 10000          # app_config.h SIM_AUTOSTART_BEACON_CODE
+BEACON_S = 30                # app_config.h SIM_AUTOSTART_BEACON_MS
+NO_READING = 0xFF01
+
+
+def synth(rows, prefix, defect=None, at=None, beacon=False, reset_at=None):
+    """Write a wire capture for `rows`.
+
+    beacon   -- prepend the autostart boot preamble (NO_READING then the 30 s
+                full-scale start beacon), as an APP_SIM_AUTOSTART build emits.
+    reset_at -- reboot at this reference index: a second boot preamble, then
+                the profile again from the top."""
     blob = bytearray()
     stamps = []
     t = 0.0
+
+    def emit(code, n):
+        nonlocal t
+        msb, lsb = (code >> 8) & 0xFF, code & 0xFF
+        chk = (~(msb + lsb)) & 0xFF
+        for _ in range(n):
+            stamps.append((len(blob), t))
+            blob.extend(bytes([0x7F, msb, lsb, chk]))
+            t += PACKET_MS / 1000.0
+
+    def boot():
+        emit(NO_READING, 10)                       # boot fail-safe
+        emit(BEACON_CODE, BEACON_S * PKTS_PER_REFRESH)
+
+    if beacon:
+        boot()
     for index, code, _seg in rows:
         n = PKTS_PER_REFRESH
         if defect == "drop" and index == at:
             n = 0                                   # whole refresh lost
         if defect == "short" and index == at:
             n = 3                                   # most of a refresh lost
-        for _ in range(n):
-            msb, lsb = (code >> 8) & 0xFF, code & 0xFF
-            chk = (~(msb + lsb)) & 0xFF
-            stamps.append((len(blob), t))
-            blob.extend(bytes([0x7F, msb, lsb, chk]))
-            t += PACKET_MS / 1000.0
+        emit(code, n)
         if defect == "corrupt" and index == at:
             blob[-1] ^= 0xFF                        # break the checksum
+        if reset_at is not None and index == reset_at:
+            boot()
+            for _i, c2, _s2 in rows:
+                emit(c2, PKTS_PER_REFRESH)
+            break
     with open(prefix + ".000.bin", "wb") as fh:
         fh.write(bytes(blob))
     with open(prefix + ".000.idx", "w") as fh:
@@ -129,6 +155,169 @@ class SoakVerifyTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("distinct pressure codes seen : 10001", out)
         self.assertIn("coverage                     : 100.0000%", out)
+
+
+@unittest.skipUnless(os.path.exists(HARNESS),
+                     "build host_tests first: make -C host_tests")
+class StartBeaconTest(unittest.TestCase):
+    """The autostart beacon marks the start of a run AND detects reboots."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="beacon")
+        cls.ref = os.path.join(cls.tmp, "ref.csv")
+        cls.rows = emit_reference(cls.ref)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_leading_beacon_skipped_and_run_still_verifies(self):
+        prefix = synth(self.rows, os.path.join(self.tmp, "beacon"), beacon=True)
+        rc, out = run_verify(prefix, self.ref)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("packets at full scale", out)
+        self.assertIn("resets       : none", out)
+        # Alignment must still land on the profile, not be thrown by the
+        # boot preamble sitting in front of it.
+        self.assertIn("aligned at reference run 0", out)
+
+    def test_second_beacon_is_reported_as_a_reset(self):
+        at = self.rows[1200][0]
+        prefix = synth(self.rows, os.path.join(self.tmp, "reset"),
+                       beacon=True, reset_at=at)
+        rc, out = run_verify(prefix, self.ref)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("BOARD RESET", out)
+        self.assertIn("board reset(s)", out)
+        # Located, not merely detected: 10 boot packets + the beacon +
+        # (at+1) refreshes of profile, then the second boot's 10 packets.
+        expect_pkt = 10 + BEACON_S * PKTS_PER_REFRESH + (at + 1) * PKTS_PER_REFRESH + 10
+        self.assertIn("reset at packet %d" % expect_pkt, out)
+
+    def test_profile_holds_at_full_scale_are_not_beacons(self):
+        """Phase A parks at 10000 for 300 s and tier 5 touches it too.
+
+        Only the beacon is followed by the status block, so those holds must
+        not be misread as reboots. Asserted against the real profile rather
+        than a contrived stream, since that adjacency is the whole rule."""
+        ref_full = os.path.join(self.tmp, "ref_full.csv")
+        rows_full = emit_reference(ref_full, RATE_MS, 0)     # phase FULL
+        runs_at_max = sum(1 for i, (_i, c, _s) in enumerate(rows_full)
+                          if c == BEACON_CODE
+                          and (i == 0 or rows_full[i - 1][1] != BEACON_CODE))
+        self.assertGreater(runs_at_max, 1,
+                           "profile should contain several full-scale holds")
+        prefix = synth(rows_full, os.path.join(self.tmp, "full_nobeacon"))
+        rc, out = run_verify(prefix, ref_full)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("none seen", out)          # zero false positives
+
+
+class ArmingTest(unittest.TestCase):
+    """--arm is the only path that may transmit, and it must fail loudly."""
+
+    class FakeBoard:
+        """Answers as app/uart_cmd.c does, so the parsing is really exercised."""
+
+        def __init__(self, rate=1000, has_sim=True, console=True):
+            self.rate, self.has_sim, self.console = rate, has_sim, console
+            self.written, self._out = [], b""
+
+        def reset_input_buffer(self):
+            pass
+
+        def flush(self):
+            pass
+
+        def write(self, data):
+            cmd = data.decode().strip()
+            self.written.append(cmd)
+            u = cmd.upper()
+            if u == "CONSOLE UNLOCK":
+                self._out = (b"Console UNLOCKED - packet stream SUSPENDED\r\n"
+                             if self.console else b"")
+            elif u.startswith("SIM PHASE"):
+                self._out = (b"Sim phase=FULL, index reset to 0\r\n"
+                             if self.has_sim else b"ERR: unknown\r\n")
+            elif u.startswith("SIM ") and "STATUS" not in u:
+                self._out = (b"Sim BAR - SYNTHETIC pressure\r\n"
+                             if self.has_sim else b"ERR: unknown\r\n")
+            elif u == "SIM STATUS":
+                self._out = ("Sim: BAR  phase=FULL  idx=0/86400  rate=%dms\r\n"
+                             % self.rate).encode()
+            elif u == "CONSOLE LOCK":
+                self._out = b"Console LOCKED - stream resuming\r\n"
+            return len(data)
+
+        def read(self, n=1):
+            out, self._out = self._out[:n], self._out[n:]
+            return out
+
+    def _arm(self, board, sim="BAR", phase="FULL", expect_rate=1000):
+        from soak_capture import Armer
+        a = Armer(board, sim, phase, expect_rate)
+        return a.run(), a
+
+    def test_healthy_board_arms_and_latches(self):
+        ok, a = self._arm(self.FakeBoard())
+        self.assertTrue(ok)
+        self.assertTrue(a.done, "TX must latch off after arming")
+
+    def test_command_sequence_and_order(self):
+        board = self.FakeBoard()
+        self._arm(board, sim="COUNTS", phase="B")
+        self.assertEqual(board.written,
+                         ["CONSOLE UNLOCK", "SIM PHASE B", "SIM COUNTS",
+                          "SIM STATUS", "CONSOLE LOCK"])
+
+    def test_rate_mismatch_aborts(self):
+        """A wrong RATE invalidates the reference — fail before the run."""
+        ok, a = self._arm(self.FakeBoard(rate=100), expect_rate=1000)
+        self.assertFalse(ok)
+        self.assertFalse(a.done)
+
+    def test_sim_not_compiled_in_aborts(self):
+        ok, _ = self._arm(self.FakeBoard(has_sim=False))
+        self.assertFalse(ok)
+
+    def test_production_build_without_console_aborts(self):
+        ok, _ = self._arm(self.FakeBoard(console=False))
+        self.assertFalse(ok)
+
+    def test_arming_is_the_only_code_that_writes_to_the_port(self):
+        """Structural invariant: without --arm the tool cannot transmit.
+
+        Checked on the AST rather than by reading the docstring, so the
+        guarantee survives future edits."""
+        import ast
+        src = open(os.path.join(HERE, "soak_capture.py")).read()
+        tree = ast.parse(src)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr == "write"
+                        and isinstance(sub.func.value, ast.Attribute)
+                        and sub.func.value.attr == "ser"
+                        and node.name != "Armer"):
+                    offenders.append("%s:%d" % (node.name, sub.lineno))
+        # module-level (outside any class) serial writes are offenders too
+        classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+        in_class = {id(x) for c in classes for x in ast.walk(c)}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "write"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "ser"
+                    and id(node) not in in_class):
+                offenders.append("module:%d" % node.lineno)
+        self.assertEqual(offenders, [],
+                         "serial write outside Armer: %s" % offenders)
 
 
 if __name__ == "__main__":

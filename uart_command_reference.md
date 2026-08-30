@@ -126,6 +126,21 @@ Points that bite if you skip them:
 - **Unlike `LINKTEST` there is no auto-expiry.** A 24-hour soak has to keep
   running. Sim state is RAM-only, so a reset returns the board to real
   acquisition — which is also how a mid-soak reset becomes visible.
+- **Autostart builds behave differently on reset.** Built with
+  `-DAPP_SIM_AUTOSTART=1` (only meaningful alongside `APP_ENABLE_SIM=1`), the
+  board arms itself at boot and needs no console at all — power on, or press
+  reset, and it streams. That is what makes an unattended logger run possible,
+  since the logger has only an RX line and can arm nothing.
+
+  Such a build first emits a **start beacon**: 30 s of full scale (`10000`)
+  before the profile begins, so the start of a run is unmissable in the
+  logger's dump. The beacon is boot-only, which makes it the reset detector —
+  exactly one per boot, so a second one in a capture means the board rebooted.
+
+  | Build | Reset signature on the wire |
+  |---|---|
+  | Console-armed | sim drops out; `UNCAL` forever after |
+  | Autostart | a second start beacon, then the profile from index 0 |
 - **Genuine ADC and excitation faults still win** in both modes, so a rig
   problem can never be masked by synthetic data.
 - **`SIM COUNTS` is not exact and must not be verified as one.** One
@@ -275,6 +290,11 @@ LINKTEST OFF      → back to live
 
 ## Changelog
 
+- **2026-08-26: `SIM` autostart + start beacon.** `-DAPP_SIM_AUTOSTART=1`
+  arms the profile at boot (no console needed — the unattended logger run) and
+  precedes it with a 30 s full-scale start beacon that doubles as the reset
+  detector. Console-armed and autostart builds therefore have different reset
+  signatures; see the `SIM` section.
 - **2026-08-26: `SIM` added (bench builds only).** Synthetic pressure profile
   standing in for the transducers, for the 24 h link-path soak: a full-range
   resolution sweep (all 10,001 codes) plus a fixed-duration ramp-timing ladder

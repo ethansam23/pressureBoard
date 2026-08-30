@@ -77,12 +77,51 @@
  * every translation unit (including link_frame.c, which does not include
  * this file) agrees: set -DAPP_ENABLE_SIM=1 on the bench Keil target only.
  *
- * Sim state is deliberately NEVER persisted to NVM — a reset always returns
- * the board to real acquisition, which also makes a mid-soak reset obvious
- * instead of silently continuing to stream fake data.                       */
+ * Sim state is deliberately NEVER persisted to NVM. Console-armed, that means
+ * a reset returns the board to real acquisition and the wire sits at UNCAL —
+ * an unmistakable reset signature. With APP_SIM_AUTOSTART the board re-arms
+ * itself at boot instead; see the reset-signature note below.               */
 #ifndef APP_ENABLE_SIM                  /* overridable from the Keil target    */
 #define APP_ENABLE_SIM          0
 #endif
+
+/* ---- Sim autostart (UNATTENDED BENCH RUNS ONLY) ------------------------- *
+ * Arms the profile at boot so a soak needs no host at all: power on (or press
+ * reset) and the board streams. That is what makes the logger run look like
+ * deployment — the logger has only an RX line and can arm nothing, and
+ * unlocking the console to arm by hand would suspend the stream.
+ *
+ * Every boot re-arms from index 0, so the reset button IS the start button.
+ *
+ * RESET SIGNATURE (differs from console-armed — the verifier relies on this):
+ * a reset re-emits the start beacon and restarts the profile, rather than
+ * dropping to UNCAL. The beacon is boot-only, so a second one anywhere in a
+ * capture is direct evidence of a reset, timestamped to the packet.         */
+#ifndef APP_SIM_AUTOSTART               /* overridable from the Keil target    */
+#define APP_SIM_AUTOSTART       0
+#endif
+#if APP_SIM_AUTOSTART && !APP_ENABLE_SIM
+#error "APP_SIM_AUTOSTART requires APP_ENABLE_SIM=1 (it has nothing to arm)"
+#endif
+
+#define SIM_AUTOSTART_MODE      SIM_MODE_BAR    /* pure link-path isolation   */
+#define SIM_AUTOSTART_PHASE     SIM_PHASE_FULL  /* A + 18xB + stop = 24 h     */
+
+/* Start beacon — full scale held for 30 s before the profile begins, so the
+ * start of a run is unmissable in the logger's own dump.
+ *
+ * LINK_VALUE_MAX (10000 = 1000.0 bar) is the highest LEGAL code. Do not be
+ * tempted by 0xFFFF: link_protocol.md §3 puts 10001-0xFEFF and the undefined
+ * 0xFFxx codes in "reserved / never transmitted", and how the logger reacts
+ * to an undefined code is an open gate (Q9) — the beacon would become a thing
+ * to debug rather than a thing to rely on.
+ *
+ * The profile also holds at 10000 (300 s in Phase A, briefly in tier 5), so a
+ * run of 10000 is not by itself a beacon. What identifies it is that a beacon
+ * is always immediately followed by the profile's status block (0xFF01), an
+ * adjacency that occurs nowhere inside the profile.                         */
+#define SIM_AUTOSTART_BEACON_MS   30000u
+#define SIM_AUTOSTART_BEACON_CODE LINK_VALUE_MAX
 
 /* ---- Unit conversion ----------------------------------------------------- *
  * Firmware is bar-native; the bench gauge reads psi. UART accepts a "PSI"

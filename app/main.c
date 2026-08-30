@@ -57,9 +57,24 @@ static void led_arbitrate(void)
  * that tolerance; only SIM_MODE_BAR is checked value-exact.                */
 static uint16 sim_step_code(acq_result_t *a)
 {
-    uint32 idx   = link_tx_sim_index();
-    uint8  phase = link_tx_sim_phase();
-    uint16 code  = sim_profile_code(idx, scheduler_get_rate_ms(), phase);
+    uint32 idx;
+    uint8  phase;
+    uint16 code;
+
+    /* Start beacon (autostart only): full scale for a fixed spell before the
+     * profile begins, so the start of a run is unmissable in the logger's own
+     * dump. It does NOT advance the profile index — index 0 must still be the
+     * profile's first sample, so the reference stream stays unchanged and the
+     * host verifier simply skips the leading beacon before aligning.       */
+    if (link_tx_sim_beacon_left() != 0u)
+    {
+        link_tx_sim_beacon_tick();
+        return (uint16)SIM_AUTOSTART_BEACON_CODE;
+    }
+
+    idx   = link_tx_sim_index();
+    phase = link_tx_sim_phase();
+    code  = sim_profile_code(idx, scheduler_get_rate_ms(), phase);
 
     link_tx_sim_advance();
 
@@ -129,6 +144,18 @@ int main(void)
      * next boot reports fresh.                                              */
     uart_cmd_set_boot_info(PMU->RESET_STS.reg, PMU->WFS.reg);
     PMU->RESET_STS.reg = 0u;
+
+#if APP_SIM_AUTOSTART
+    /* Arm the synthetic profile at boot so an unattended soak needs no host
+     * at all — power on, or press reset, and the board streams. The logger
+     * has only an RX line and can arm nothing, and unlocking the console to
+     * arm by hand would suspend the very stream under test.
+     *
+     * Beacon length is resolved against the rate loaded from NVM just above,
+     * so it is a fixed wall-clock 30 s whatever RATE is set to.            */
+    link_tx_sim_autostart((uint8)SIM_AUTOSTART_MODE, (uint8)SIM_AUTOSTART_PHASE,
+                          SIM_AUTOSTART_BEACON_MS / scheduler_get_rate_ms());
+#endif
 
     /* ---- Enable VDDEXT; BOUNDED wait for it to stabilize ---------------- *
      * Never spin here forever. VDDEXT can latch off (undervoltage/overtemp),

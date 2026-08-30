@@ -50,6 +50,7 @@ static uint32 test_t0;
 static uint8  sim_mode_v;          /* SIM_MODE_OFF / _BAR / _COUNTS          */
 static uint8  sim_phase_v;         /* SIM_PHASE_FULL / _A / _B               */
 static uint32 sim_index_v;         /* advances once per refresh              */
+static uint32 sim_beacon_v;        /* boot-only start beacon, refreshes left */
 #endif
 
 /* ========================================================================= */
@@ -66,7 +67,13 @@ void link_tx_init(void)
     PORT_ChangePinAlt(0x10u, 3u);
 
     /* P1.1 (console RX, unused downhole) floats without this: pull it to
-     * the UART idle level so line noise cannot form characters.             */
+     * the UART idle level so line noise cannot form characters.
+     *
+     * No ChangePinAlt for P1.1: RXD is an INPUT SELECT (INP6), not an ALTSEL
+     * function, and its source mux runs on reset defaults — nothing in app/
+     * or the generated port_defines.h writes it. Verified working on the
+     * bench at 9600; if console RX ever goes dead, that mux is the first
+     * place to look.                                                        */
     PORT_P11_PullUp_Set();
     PORT_P11_PullUpDown_En();
 
@@ -304,9 +311,23 @@ void link_tx_sim_set(uint8 mode, uint8 phase)
 {
     /* Restarting the profile on every mode change keeps a run's index origin
      * unambiguous — the reference stream always starts at index 0.          */
-    sim_mode_v  = mode;
-    sim_phase_v = phase;
-    sim_index_v = 0u;
+    sim_mode_v   = mode;
+    sim_phase_v  = phase;
+    sim_index_v  = 0u;
+    sim_beacon_v = 0u;    /* console arming never beacons — see link_tx.h    */
+}
+
+void link_tx_sim_autostart(uint8 mode, uint8 phase, uint32 beacon_refreshes)
+{
+    link_tx_sim_set(mode, phase);
+    sim_beacon_v = beacon_refreshes;
+}
+
+uint32 link_tx_sim_beacon_left(void) { return sim_beacon_v; }
+
+void link_tx_sim_beacon_tick(void)
+{
+    if (sim_beacon_v != 0u) { sim_beacon_v--; }
 }
 uint8  link_tx_sim_mode(void)     { return sim_mode_v; }
 uint8  link_tx_sim_phase(void)    { return sim_phase_v; }
