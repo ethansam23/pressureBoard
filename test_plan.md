@@ -121,13 +121,11 @@ python -m serial.tools.list_ports -v          # find the board's COM port
 python soak_capture.py --port COM5 --out logs/smoke --arm --sim BAR --phase B
 
 # 2.2 — score it against the committed reference
-python soak_verify.py --capture logs/smoke ^
-       --reference ../host_tests/refs/phaseB_rate1000.csv --rate 1000
+python soak_verify.py --capture logs/smoke --reference ../host_tests/refs/phaseB_rate1000.csv --rate 1000
 
 # 2.3 — Test B: the same, run for a full 1 h ladder cycle
 python soak_capture.py --port COM5 --out logs/ladder --arm --sim BAR --phase B --hours 1
-python soak_verify.py --capture logs/ladder ^
-       --reference ../host_tests/refs/phaseB_rate1000.csv --rate 1000
+python soak_verify.py --capture logs/ladder --reference ../host_tests/refs/phaseB_rate1000.csv --rate 1000
 ```
 
 | Step | Gate |
