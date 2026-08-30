@@ -4,6 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
+> ### ⚠ BOARD HARDWARE REV 2 ONLY
+> This branch (`claude/nor-datalog`) is the **only** firmware line targeting
+> **board hardware Rev 2**. Every other branch — `main`,
+> `claude/rearchitecture`, `claude/link-sim-waveform-soak`, `exp/adc-scope`
+> — targets **board Rev 1**. Do not merge board-rev lines together without
+> deciding which board the result is for.
+>
+> **"Rev 2" is overloaded in this repo.** `TLE9854_pressure_transmitter_PRD_rev2.md`
+> is the *requirements-document* revision and applies to **both** boards. It
+> is unrelated to the board revision. Always write **"board Rev 2"** or
+> **"PRD Rev 2"** — never bare "Rev 2".
+>
+> Board Rev 2 differences: adds the onboard **IS25LP128F NOR flash** on SSC1
+> (Rev 1 has none, so all of `app/spi_nor.*` and the `LOG` commands are
+> Rev-2-only), which forced the **status LED from P0.4 to P1.4**.
+> Cross-flashing is silent — no revision strap, no runtime check. A Rev 2
+> image on a Rev 1 board just has a **dead LED** (and SSC1 driving Rev 1's
+> LED pin); a Rev 1 image on a Rev 2 board drives the LED onto flash SI.
+> **Confirm the board revision before flashing.**
+
 Firmware for a downhole pressure transmitter on the Infineon **TLE9854QXW** (ARM Cortex-M0, Keil µVision project). Two ratiometric pressure probes on ADC1 (12-bit-scaled oversampling), multi-point linear calibration applied **on-board**, and a **one-way digital UART packet stream** (9600 8N1 on P1.0) to the battery/logger — the only downhole interface. A bench-only debug console shares the same UART under strict mutual exclusion (boots LOCKED; `CONSOLE UNLOCK` suspends the stream). Wire spec + logger questionnaire: `link_protocol.md`. There is no emulator — the protocol core has a gcc host test suite (`host_tests/`), everything else is verified on hardware (`verification_guide.md`).
 
 ## Build / flash / run
@@ -55,6 +75,7 @@ All pins, tuning constants, addresses, and defaults live in `app/app_config.h` �
 
 ## Current state / gotchas
 
+- **This branch is board Rev 2 firmware; every other branch is board Rev 1.** Nothing in the build or at runtime detects a mismatch — the only symptom is a dead status LED, which makes every LED-based step in `verification_guide.md` silently unreliable. See the banner at the top of this file and in `app/app_config.h`.
 - **Flashing this firmware wipes settings + calibration by design** (both NVM magics bumped for the 12-bit count scale) — re-enter settings, re-calibrate on a rig before the wire carries pressure.
 - Counts are 12-bit-SCALED (0–4092, `sum/4`); "effective bits" is unproven until the bench RAW noise capture (verification guide Test 9). RAW/SCAN diagnostics stay native 10-bit (4× factor vs production counts).
 - TI timing is a **working hypothesis** (stop-bit start; +1-bit allowance everywhere) pending a scope measurement — don't tighten timing constants without that data.
@@ -65,7 +86,7 @@ All pins, tuning constants, addresses, and defaults live in `app/app_config.h` �
 ## Reference docs
 
 - `link_protocol.md` — **normative wire spec** + logger-designer questionnaire + rate/gap metrics.
-- `TLE9854_pressure_transmitter_PRD_rev2.md` — requirements, acceptance criteria (Rev 1 = analog era, superseded, history only).
+- `TLE9854_pressure_transmitter_PRD_rev2.md` — requirements, acceptance criteria (PRD Rev 1 = analog era, superseded, history only). **PRD revision ≠ board revision** — this PRD covers board Rev 1 and Rev 2 alike.
 - `uart_command_reference.md` — bench console surface.
 - `nvm_memory_reference.md` — memory map and how the mapped data flash actually behaves.
 - `verification_guide.md` — on-hardware test procedure (standalone, J-Link detached; scope on P1.0 is mandatory).

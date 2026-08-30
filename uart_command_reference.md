@@ -4,6 +4,12 @@ Bench command set for the TLE9854QXW downhole pressure transmitter (digital-link
 firmware). _Source of truth: `app/uart_cmd.c` (`process_cmd`). Update this file
 when commands change._
 
+> **Board hardware Rev 2.** This command set documents the Rev 2 firmware. The
+> `LOG` family below needs the onboard NOR flash, which **only exists on board
+> Rev 2** — on a Rev 1 board those commands answer, but the flash never will.
+> (Board revision is *not* the same thing as PRD Rev 2, which covers both
+> boards.) The status LED is on **P1.4** here, **P0.4** on Rev 1.
+
 ---
 
 ## The shared line — read this first
@@ -90,7 +96,12 @@ failed fence reports `NVM write failed` and leaves stored settings untouched.
 LINKTEST active** — the 5-min expiry and the power-cycle reset are backstops,
 not the plan.
 
-### Onboard NOR flash (IS25LP128F, 16 MB on SSC1)
+### Onboard NOR flash (IS25LP128F, 16 MB on SSC1) — board Rev 2 only
+
+**Rev 1 boards have no NOR flash.** On a Rev 1 board `LOG STATUS` reports the
+part absent with an all-`00`/all-`FF` JEDEC ID — which is the *same* reading a
+genuinely broken Rev 2 board gives. Confirm which board is on the bench before
+reading anything into that result.
 | Command | Description |
 |---|---|
 | `LOG STATUS` | Presence, raw JEDEC ID, status register, active SSC1 clock phase |

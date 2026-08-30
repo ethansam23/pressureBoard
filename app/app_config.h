@@ -4,16 +4,42 @@
 /*******************************************************************************
  * Pressure Transmitter — compile-time configuration
  *
+ * =========================== BOARD HARDWARE REV 2 ===========================
+ * THIS FIRMWARE IS FOR BOARD HARDWARE REV 2 AND ONLY REV 2.
+ * Every other firmware branch in this repo targets board Rev 1.
+ *
+ * Do not confuse this with TLE9854_pressure_transmitter_PRD_rev2.md — that
+ * is the REQUIREMENTS-DOCUMENT revision and it applies to both boards. The
+ * two numbering schemes are unrelated. Always write "board Rev 2" or "PRD
+ * Rev 2"; bare "Rev 2" in this repo is ambiguous — it already means the PRD.
+ *
+ * What board Rev 2 changed:
+ *   - Adds the onboard IS25LP128F NOR flash on SSC1 (P0.3/P0.4/P0.5/P1.2).
+ *     Rev 1 has no flash — the whole spi_nor module is Rev-2-only.
+ *   - Status LED moved P0.4 -> P1.4, forced by the above: P0.4 became
+ *     SSC1_M_MTSR (flash SI).
+ *
+ * Cross-flashing fails SILENTLY — there is no revision strap to read and
+ * nothing detects the mismatch at runtime:
+ *   - This image on a Rev 1 board: the LED is driven on P1.4, which Rev 1
+ *     does not wire to the LED, so the LED stays dark and every LED-based
+ *     diagnostic in verification_guide.md quietly lies. SSC1 meanwhile
+ *     drives P0.4 — which on Rev 1 IS the LED.
+ *   - A Rev 1 image on a Rev 2 board: LED output drives the flash SI line.
+ *
+ * CONFIRM THE BOARD REVISION BEFORE YOU FLASH.
+ * ===========================================================================
+ *
  * All pin assignments, tuning constants, and TBD placeholders live here.
  * Items marked TODO are waiting on hardware confirmation.
  ******************************************************************************/
 
-/* ---- Pin map (matches PRD §3) -------------------------------------------- *
+/* ---- Pin map (BOARD REV 2 — matches PRD §3) -------------------------------------------- *
  * PIN_* values use the PORT_ChangePinAlt() encoding: high nibble = port,
  * low nibble = pin (so P1.4 == 0x14).
  *
  *   P0.3 (27)  SSC1_M_SCK   ALT1   NOR flash SCK
- *   P0.4 (28)  SSC1_M_MTSR  ALT1   NOR flash SI   (was the status LED)
+ *   P0.4 (28)  SSC1_M_MTSR  ALT1   NOR flash SI   (status LED on Rev 1)
  *   P0.5 (29)  SSC1_M_MRST  INP1   NOR flash SO
  *   P1.2 (33)  GPIO out            NOR flash CE#
  *   P1.4 (34)  GPIO out            status LED
@@ -22,8 +48,10 @@
  *   P2.7 / P2.3                    Probe A / Probe B (ADC1)
  *                                                                            */
 #define PIN_LED_STATUS          0x14u   /* P1.4 — status LED, push-pull.
-                                         * Moved from P0.4 on the NOR spin:
-                                         * P0.4 is SSC1_M_MTSR (flash SI).
+                                         * BOARD REV 2 PIN. Rev 1 has the LED
+                                         * on P0.4; it moved because Rev 2
+                                         * made P0.4 SSC1_M_MTSR (flash SI).
+                                         * Wrong on a Rev 1 board.
                                          * DOCUMENTATION ONLY — the SDK has
                                          * one inline fn per pin, so
                                          * status_led.c names PORT_P14_*

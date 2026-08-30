@@ -9,8 +9,10 @@ static uint8       phase;       /* sub-step within a pattern                 */
 static bool        led_on;
 
 /* ---- helpers ------------------------------------------------------------ *
- * The LED lives on P1.4 (pin 34) — moved off P0.4 on the NOR-flash spin,
- * where P0.4 became SSC1_M_MTSR (flash SI). The SDK exposes one inline
+ * BOARD REV 2: the LED lives on P1.4 (pin 34). On Rev 1 it is on P0.4 — it
+ * moved because Rev 2 made P0.4 SSC1_M_MTSR (NOR flash SI). This file and
+ * PIN_LED_STATUS are the two places a Rev 1/Rev 2 mix-up surfaces, and it
+ * surfaces as a dead LED, not an error. The SDK exposes one inline
  * function per pin, so the port is named literally here rather than derived
  * from PIN_LED_STATUS; keep the two in step if the pin ever moves again.    */
 static void led_set(bool on)
