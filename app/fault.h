@@ -30,6 +30,19 @@ void fault_clear_adc(void);
 void fault_raise_vddext(void);       /* excitation rail unstable               */
 void fault_clear_vddext(void);
 
+/* ---- VDDEXT hardware shutdown cause ------------------------------------ *
+ * The regulator LATCHES why it shut down (VDDEXT_CTRL.VDDEXT_UV_IS /
+ * VDDEXT_OT_IS) and will not restart while the latch stands. Main's recovery
+ * path must clear it — which destroys the only record of the cause. So it
+ * captures the bits here first: sticky since boot, reported by the bench
+ * console, so a rail that died and recovered is still diagnosable.          */
+#define VDDEXT_CAUSE_UV  0x01u       /* undervoltage shutdown (VDDEXT_UV_IS)   */
+#define VDDEXT_CAUSE_OT  0x02u       /* overtemperature       (VDDEXT_OT_IS)   */
+
+void   fault_note_vddext_cause(uint8 cause);  /* OR in + count the clear      */
+uint8  fault_get_vddext_cause(void);          /* sticky OR since boot         */
+uint16 fault_get_vddext_trips(void);          /* latched shutdowns cleared    */
+
 /* Per-cause queries (priority/encoding decided by the caller) */
 bool fault_disagree_active(void);
 bool fault_adc_active(void);

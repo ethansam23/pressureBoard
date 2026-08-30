@@ -9,6 +9,7 @@
 #include "fault.h"
 #include "nvm_config.h"
 #include "uart_cmd.h"
+#include "spi_nor.h"
 
 static acq_result_t acq;
 
@@ -19,6 +20,68 @@ static bool vddext_stable(void)
     return (u1_Field_Rd32(&PMU->VDDEXT_CTRL.reg,
                           (uint8)PMU_VDDEXT_CTRL_VDDEXT_STABLE_Pos,
                           PMU_VDDEXT_CTRL_VDDEXT_STABLE_Msk) == 1u);
+}
+
+/* Capture, then clear, the regulator's latched shutdown cause. Returns true
+ * if anything was latched.
+ *
+ * This is the difference between a rail that recovers and one that is dead
+ * until the next power cycle: VDDEXT latches its UV/OT cause, and
+ * PMU_VDDEXT_On() only re-asserts ENABLE. With the latch standing, every
+ * retry is a no-op and the rail sits at 0 V forever.
+ *
+ * Capture before clearing — clearing destroys the only record of WHY the
+ * rail went down, and on a sealed board that record is the whole diagnosis. */
+static bool vddext_clear_latch(void)
+{
+    uint8 cause = 0u;
+
+    if (u1_Field_Rd32(&PMU->VDDEXT_CTRL.reg,
+                      (uint8)PMU_VDDEXT_CTRL_VDDEXT_UV_IS_Pos,
+                      PMU_VDDEXT_CTRL_VDDEXT_UV_IS_Msk) == 1u)
+    {
+        cause |= (uint8)VDDEXT_CAUSE_UV;
+    }
+    if (u1_Field_Rd32(&PMU->VDDEXT_CTRL.reg,
+                      (uint8)PMU_VDDEXT_CTRL_VDDEXT_OT_IS_Pos,
+                      PMU_VDDEXT_CTRL_VDDEXT_OT_IS_Msk) == 1u)
+    {
+        cause |= (uint8)VDDEXT_CAUSE_OT;
+    }
+
+    if (cause == 0u) { return false; }
+
+    fault_note_vddext_cause(cause);
+
+    if ((cause & (uint8)VDDEXT_CAUSE_UV) != 0u)
+    {
+        PMU_VDDEXT_UV_Int_Clr();                 /* VDDEXT_UV_ISC            */
+    }
+    if ((cause & (uint8)VDDEXT_CAUSE_OT) != 0u)
+    {
+        PMU_VDDEXT_OT_Int_Clr();                 /* VDDEXT_OT_ISC            */
+        PMU_VDDEXT_OT_Clr();                     /* VDDEXT_OT_SC             */
+    }
+    return true;
+}
+
+/* Full re-enable attempt for a rail that is NOT currently stable. Clearing
+ * the latch is what lets the regulator restart; the ENABLE 0->1 edge is
+ * deliberate belt-and-braces — the datasheet documents that undervoltage
+ * SETS VDDEXT_UV_IS (P_2.3.9) but not whether clearing alone restarts the
+ * LDO, so this works under either semantics.
+ *
+ * Only toggled when something was actually latched: a rail that is merely
+ * still ramping into its output cap must be left alone to finish, not
+ * restarted. Called at most once per refresh (>=100 ms), so a hard overload
+ * gets retried at a sane cadence rather than cycled.                        */
+static bool vddext_recover(void)
+{
+    if (vddext_clear_latch())
+    {
+        (void)PMU_VDDEXT_Off();
+    }
+    return PMU_VDDEXT_On();
 }
 
 /* Single owner of the LED pattern. Modules no longer set the LED directly
@@ -71,6 +134,14 @@ int main(void)
     uart_cmd_init();            /* debug builds: console RX, BOOTS LOCKED —
                                  * zero TX text until CONSOLE UNLOCK          */
 
+    /* Onboard NOR flash (SSC1 — never touches UART2, so no fence is needed
+     * and the stream started above is undisturbed). The probe is a 4-byte
+     * blocking transaction, ~32 µs; everything downstream gates on its
+     * result, so a missing or miswired flash costs one ID read and is then
+     * reported through the bench console rather than retried on the wire.  */
+    spi_nor_init();
+    (void)spi_nor_probe();
+
     /* Reset cause: captured for the console unlock banner (nothing may
      * print at boot — the wire carries packets only), then cleared so the
      * next boot reports fresh.                                              */
@@ -85,7 +156,17 @@ int main(void)
      * bench-only and invisible downhole. The link is serviced THROUGHOUT
      * the wait so the stream starts on schedule.                            */
     {
-        uint32 vddext_t0 = scheduler_get_ms();
+        uint32 vddext_t0;
+
+        /* Clear a latch carried in from before this reset FIRST. A warm NRST
+         * does not necessarily clear it, and while it stands the wait below
+         * is 100 ms of no-op retries ending in a fault every single boot.
+         * Cleared once, outside the loop: re-clearing per iteration would
+         * restart the ramp every 200 µs and a large output cap would never
+         * finish charging.                                                  */
+        (void)vddext_clear_latch();
+
+        vddext_t0 = scheduler_get_ms();
         while (PMU_VDDEXT_On() == false)
         {
             (void)WDT1_Service();
@@ -148,7 +229,7 @@ int main(void)
                 if (acq.stalled) { fault_raise_adc(); }
                 else             { fault_clear_adc(); }
 
-                if (vddext_stable() || PMU_VDDEXT_On())
+                if (vddext_stable() || vddext_recover())
                 {
                     fault_clear_vddext();
                 }
