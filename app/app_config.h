@@ -108,12 +108,10 @@
 /* #define PIN_SYNC_GPIO        TBDu */
 
 /* ---- Refresh / sample rate ---------------------------------------------- */
-#define REFRESH_RATE_DEFAULT_MS 10000u  /* 10 s — matches the reference tool's
-                                         * cadence (PRD 4.5). NOTE: only
-                                         * applies to a board with no valid
-                                         * settings page; an existing NVM save
-                                         * keeps its stored rate -- use
-                                         * RATE 10000 to move those.          */
+#define REFRESH_RATE_DEFAULT_MS 100u    /* 100 ms (10 Hz). NOTE: applies only
+                                         * to a board with no valid settings
+                                         * page; an existing NVM save keeps its
+                                         * stored rate -- RATE 100 moves those */
 #define REFRESH_RATE_MIN_MS     100u    /* fastest  (10 Hz)                   */
 #define REFRESH_RATE_MAX_MS     10000u  /* slowest  (0.1 Hz)                  */
 
