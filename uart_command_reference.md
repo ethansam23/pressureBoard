@@ -45,7 +45,7 @@ reset cause — `PIN`/`POR`/`WDT1`/`LOCKUP`/…) and timestamped markers
 ### Settings — persisted to NVM
 | Command | Range / values | Description |
 |---|---|---|
-| `RATE <ms>` | 100–5000 ms | Refresh / output update rate (out-of-range or non-numeric → `ERR: rate 100-5000`) |
+| `RATE <ms>` | 100–10000 ms | Refresh / output update rate (out-of-range or non-numeric → `ERR: rate 100-10000`) |
 | `THRESH <cnt>` | 1–1023 counts | Probe-disagreement fault threshold (~thresh/8 hysteresis on clear) |
 | `RANGE <lo> <hi> [PSI]` | `0 ≤ lo < hi ≤ 1000` bar, span ≥ 1 | Output pressure window: `lo`→0.5 V, `hi`→4.5 V. `PSI` suffix converts both operands |
 | `PROBE A\|B\|AVG` | `A`, `B`, `AVG` (or `DUAL`) | Probe source select |
@@ -71,8 +71,8 @@ at most **one per loop pass**, so a pasted batch executes sequentially.
 | `CAL CLEAR` | Erase the stored calibration (on erase failure: `Cal cleared (RAM only - ...)`) |
 | `CAL ABORT` | Abort the current session |
 
-**Timing:** each capture averages `8 × RATE` ms of readings (8 s at the default
-1000 ms — set `RATE 100` during bench cal for ~0.8 s captures, restore after).
+**Timing:** each capture averages `8 × RATE` ms of readings (80 s at the default
+10000 ms — set `RATE 100` during bench cal for ~0.8 s captures, restore after).
 `CAL STORE` itself takes ~10 ms; the 2 s solid LED afterward is the *stored*
 indicator, not store-in-progress. While **capturing**, `CAL ARM`/`CAL STORE`/
 another `CAL <bar>` are rejected (`ERR: capture in progress…`) so the in-flight
@@ -138,8 +138,10 @@ In **priority order** (higher rows override lower ones):
 
 `Avg` is the probe source selected by `PROBE` (A only, B only, or the average).
 
-**Boot fail-safe:** from reset until the first completed reading (~1 refresh
-period), the line is held at **fault-low ≈ 0.25 V** so the battery can't
+**Boot fail-safe:** from reset until the first completed reading, the line is
+held at **fault-low ≈ 0.25 V**. That first refresh is forced on the opening
+loop pass rather than one full `RATE` period in, so the window stays a few ms
+regardless of the configured rate so the battery can't
 mistake a not-yet-measured boot value for a real ambient pressure.
 
 ---
@@ -165,7 +167,7 @@ CAL 14.7 PSI     → capture at ambient ("Capturing at 1.013 bar (14.700 psi)...
 CAL 7250 PSI     → capture at 500 bar reference
 CAL STORE        → "Cal stored: slope=.. offset=.."
 CAL STATUS       → verify VALID
-RATE 1000        → restore the operating rate
+RATE 10000       → restore the operating rate
 ```
 
 **Test the output stage independent of the sensor:**
@@ -192,6 +194,7 @@ OUTPUT AUTO      → resume live  (IMPORTANT: forgetting this pins the output)
 
 ## Changelog
 
+- **2026-09-03:** refresh cadence stretched to the reference tool's 10 s — `RATE` ceiling raised 5000 → 10000 ms and the power-on default moved 1000 → 10000 ms (a board with a valid settings page keeps its stored rate; use `RATE 10000` to move it). The first refresh now fires on the opening loop pass, so the boot fault-low window no longer scales with `RATE`. Note the fault→line latency is one refresh period, i.e. up to 10 s at the new default.
 - **2026-06-10:** PSI front end — `CAL <x> PSI`, `RANGE <lo> <hi> PSI`, and `PSI <x>`/`BAR <x>` converters (firmware stays bar-native). Round-2 verified fixes: removed the double WDT1 window-count (the standalone boot-reset loop); NVM saves are now a single mapped-page write (power-fail-safe, no pre-erase) with `nvm: … rc=` diagnostics; fault also raised on ADC stall; VDDEXT supervision re-enables a latched-off regulator; ~thresh/8 fault hysteresis; capture pauses during faults and CAL ARM/STORE/<bar> are rejected mid-capture; CAL CLEAR reports erase failure honestly; failed STORE keeps the previous fit live; strict numeric parsing everywhere; one command per loop pass; bare keywords print usage; trailing spaces trimmed; TEMP boot/reset-cause diagnostics added.
 - **2026-06-09:** fix batch from the doc-vs-firmware audit — RATE now rejects out-of-range (`ERR: rate 100-5000`) instead of persisting an unclamped value; arguments case-insensitive (`Rate 500` works); `OUTPUT` rejects non-numeric args; CAL STORE errors are now distinct (need >=2 pts / degenerate fit / NVM write failed); `CAL <bar>` at the 8-point cap errors instead of silently doing nothing; CAL ABORT added to on-device HELP; cal points persist across power cycles; boot output is fault-low until the first reading; fault (incl. new VDDEXT supervision) overrides manual; TX buffer 1024 B (HELP no longer truncates).
 - _(add dated entries here as commands change — e.g. "2026-06-07: added PROBE, RANGE; CAL now in bar")_

@@ -536,7 +536,7 @@ static void process_cmd(const char *cmd)
         }
         else
         {
-            uart_send_str("ERR: rate 100-5000\r\n");
+            uart_send_str("ERR: rate 100-10000\r\n");
         }
     }
     else if (cmd_prefix(cmd, "RANGE "))
@@ -844,7 +844,7 @@ static void process_cmd(const char *cmd)
         uart_send_str("  HELP            — this list\r\n");
     }
     /* Bare keywords: print the command's usage instead of "unknown". */
-    else if (cmd_eq(cmd, "RATE"))   { uart_send_str("ERR: RATE <100-5000 ms>\r\n"); }
+    else if (cmd_eq(cmd, "RATE"))   { uart_send_str("ERR: RATE <100-10000 ms>\r\n"); }
     else if (cmd_eq(cmd, "THRESH")) { uart_send_str("ERR: THRESH <1-1023>\r\n"); }
     else if (cmd_eq(cmd, "RANGE"))  { uart_send_str("ERR: RANGE <lo> <hi> [PSI]  (0<=lo<hi<=1000 bar)\r\n"); }
     else if (cmd_eq(cmd, "PROBE"))  { uart_send_str("ERR: PROBE A|B|AVG\r\n"); }

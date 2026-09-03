@@ -12,7 +12,12 @@ static uint32 last_refresh_ms;
 void scheduler_init(void)
 {
     tick_ms         = 0u;
-    refresh_flag    = false;
+    /* Fire the FIRST refresh on the opening loop pass instead of one full
+     * interval after boot. The output boots in the fault-low band and only
+     * leaves it once a reading lands, so without this the analog line sits
+     * out-of-band for a whole refresh period at every power-up -- 10 s at
+     * the default rate, which the battery reads as a fault.               */
+    refresh_flag    = true;
     refresh_rate_ms = REFRESH_RATE_DEFAULT_MS;
     last_refresh_ms = 0u;
 }
