@@ -78,7 +78,7 @@ invisible to the logger); any logger-side processing.
 
 ### 4.3 Output — the downhole interface (replaces Rev 1 §4.3 entirely)
 - Wire contract: **`link_protocol.md` is normative** (9600 8N1; sync `0x7F`;
-  >2 ms gap; MSB/LSB/checksum; <10 ms packet; >20 ms idle; 40 ms period;
+  >2 ms gap; MSB/LSB/checksum; <10 ms packet; >20 ms idle; 110 ms period;
   payload sacred — 0x7F legal in payload/checksum; big-endian; additive
   checksum as specified by the logger designer).
 - Encoding: 0–10000 = deci-bar absolute; `0xFF01–0xFF07` status codes with
@@ -96,9 +96,9 @@ invisible to the logger); any logger-side processing.
   only as a last-resort net for unpredicted stalls, with conservative
   recovery (full idle before the next sync; worst wire artifact = sync +
   silence, never a partial data block).
-- Rate/availability: 25 pkt/s nominal; worst valid-packet gap ≈ 75 ms;
+- Rate/availability: ~9.1 pkt/s nominal; worst valid-packet gap ≈ 145 ms;
   ≈ 24 pkt/s sustained during an ADC fault; supports logger recording
-  ≤ ~11–12.5 Hz (gate Q7: rate vs max-gap semantics).
+  ≤ ~4–4.5 Hz (gate Q7: rate vs max-gap semantics — now load-bearing).
 
 ### 4.4 Bench console + TX purity (replaces Rev 1 §4.4)
 - **Production firmware emits packets and nothing else** — console compiled
@@ -157,7 +157,7 @@ Normative list + questionnaire: `link_protocol.md` §5–§8. Highlights:
 2. Fault-page codes stored verbatim; excluded from any pressure averaging.
 3. Gap-based framing / per-packet auto-baud / byte-order confirmations.
 4. Harness provides the line's idle-high pull during transmitter reset.
-5. Logger record rate vs the 25 pkt/s stream (2× rule semantics).
+5. Logger record rate vs the ~9.1 pkt/s stream (2× rule semantics).
 
 ## 8. Verification strategy
 
@@ -180,8 +180,8 @@ Normative list + questionnaire: `link_protocol.md` §5–§8. Highlights:
 - **From power-on the wire carries valid packets and nothing else** (all
   builds; scope-verified): `NO_READING` → `UNCAL`/pressure.
 - Scope timing within limits: packet < 9.5 ms, gap 2.9–5.0 ms, idle ≥ 22 ms,
-  period 40 ms, baud within ±2 %.
-- 5-minute soak: zero checksum errors at the host monitor, ≈ 25 pkt/s.
+  period 110 ms, baud within ±2 %.
+- 5-minute soak: zero checksum errors at the host monitor, ≈ 9.1 pkt/s.
 - Every induced fault appears as its distinct code on the wire; recovery
   returns the live value.
 - LINKTEST vectors byte-exact, including `0x7F` in LSB and checksum

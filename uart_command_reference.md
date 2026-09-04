@@ -71,7 +71,7 @@ Unknown input returns `ERR: unknown '<x>' (try HELP)`. A bare keyword
 ### Settings — persisted to NVM
 | Command | Range / values | Description |
 |---|---|---|
-| `RATE <ms>` | 100–5000 ms | Sample/refresh rate (the stream repeats the latest value at 25 pkt/s regardless) |
+| `RATE <ms>` | 100–5000 ms | Sample/refresh rate (the stream repeats the latest value at ~9.1 pkt/s regardless) |
 | `THRESH <cnt>` | 1–4092 counts (12-bit-scaled) | Probe-disagreement threshold (~thresh/8 hysteresis on clear) |
 | `PROBE A\|B\|AVG` | `A`, `B`, `AVG` (or `DUAL`) | Probe source select |
 

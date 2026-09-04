@@ -74,18 +74,22 @@ class TestCleanStream(unittest.TestCase):
         self.assertEqual(frames(ev), [0x7F7F, 42])
 
     def test_frame_rate_chunked_timestamps(self):
-        # The GUI reads the serial port in ~0.1 s chunks, so 2-3 frames of a
-        # 25/s stream share one timestamp (zero intervals). frame_rate() must
-        # still report ~25/s, not the chunk cadence (~10/s).
-        d = LinkDecoder()
-        by_chunk = {}
-        for j in range(250):                    # 250 frames = 10 s at 25/s
-            by_chunk.setdefault(int(j * 0.040 / 0.1), []).append(j)
-        for c in sorted(by_chunk):
-            d.feed(stream([42] * len(by_chunk[c])), t=(c + 1) * 0.1)
-        rate = d.frame_rate()
-        self.assertIsNotNone(rate)
-        self.assertAlmostEqual(rate, 25.0, delta=1.5)
+        # The GUI reads the serial port in ~0.1 s chunks. The decoder is a
+        # generic host tool, so it must recover the true rate on both sides of
+        # that chunk boundary: 0.110 s is the current firmware period (frames
+        # sparser than a chunk), 0.040 s is the pre-4b period and still the
+        # case that puts 2-3 frames under one timestamp with zero intervals --
+        # frame_rate() must report the frame cadence, not the chunk cadence.
+        for period, expect in ((0.110, 1 / 0.110), (0.040, 25.0)):
+            d = LinkDecoder()
+            by_chunk = {}
+            for j in range(int(10.0 / period)):         # 10 s of stream
+                by_chunk.setdefault(int(j * period / 0.1), []).append(j)
+            for c in sorted(by_chunk):
+                d.feed(stream([42] * len(by_chunk[c])), t=(c + 1) * 0.1)
+            rate = d.frame_rate()
+            self.assertIsNotNone(rate, f"period={period}")
+            self.assertAlmostEqual(rate, expect, delta=1.5, msg=f"period={period}")
 
     def test_chunked_feeds(self):
         data = stream(list(range(0, 2000, 7)))
@@ -179,13 +183,15 @@ class TestGoldenStream(unittest.TestCase):
         for row in rows:
             got += frames(d.feed(bytes([int(row["byte"])]),
                                  t=float(row["time_ms"]) / 1000.0))
-        self.assertGreaterEqual(len(got), 240)      # ~250 packets in 10 s
+        self.assertGreaterEqual(len(got), 86)       # ~91 packets in 10 s
         self.assertEqual(d.checksum_errors, 0)
         self.assertEqual(d.text_bytes, 0)
         self.assertEqual(set(got), {1234})          # the simulation's code
         rate = d.frame_rate()
         self.assertIsNotNone(rate)
-        self.assertAlmostEqual(rate, 25.0, delta=1.5)
+        # This capture comes from the firmware sim, so the rate follows
+        # LINK_PACKET_PERIOD_MS (110 ms -> ~9.09/s; was 40 ms -> 25/s).
+        self.assertAlmostEqual(rate, 1000.0 / 110.0, delta=1.5)
 
 
 if __name__ == "__main__":

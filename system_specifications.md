@@ -28,7 +28,7 @@ with the test that resolves them. Firmware-level wire detail lives in
 |---|---|
 | Pressure range (wire scale, fixed absolute) | 0 – 1000.0 bar, 0.1 bar/LSB |
 | Sample rate (measurement) | 1 Hz default, settable 0.2 – 10 Hz |
-| Transmission rate | 25 packets/s (each reading sent ~25×) |
+| Transmission rate | ~9.1 packets/s (each reading sent ~9× at 1 Hz refresh) |
 | Accuracy target | ±1–2 bar after calibration @ ref temp — **UNVERIFIED** (gain + noise, bench Test 9) |
 | Resolution (ADC path) | ~0.24 bar/count at 12-bit-scaled (~0.98 bar native) |
 | Flash / RAM usage | 24.5 KB of 64 KB (38 %) / ~2.2 KB of 4 KB (54 %) |
@@ -102,8 +102,8 @@ fault. "12 effective bits" requires ≥1 native LSB of noise dither —
    multi-point least-squares fit, up to 8 points, NVM-persisted).
 5. Encode: deci-bar 0–10000, clamps −5…0→0 / 1000–1010→10000, non-finite →
    UNCAL; priority ladder ADC_STALL > VDDEXT > DISAGREE > UNCAL > pressure.
-6. Latency sample→wire: ≤ one refresh period + ≤40 ms packet slot
-   (**~1.04 s worst at 1 Hz**; ~140 ms at 10 Hz).
+6. Latency sample→wire: ≤ one refresh period + ≤110 ms packet slot
+   (**~1.11 s worst at 1 Hz**; ~210 ms at 10 Hz).
 
 ## 6. Output link (summary — normative detail in `link_protocol.md`)
 
@@ -111,9 +111,9 @@ fault. "12 effective bits" requires ≥1 native LSB of noise dither —
 |---|---|
 | Physical | UART 9600 8N1 on P1.0, one-way, 5 V push-pull, high-Z in reset (harness pull-up required) |
 | Packet | `0x7F` + gap + MSB/LSB/checksum; total gap+4.17 ms = 7.1–9.2 ms (<10 ms spec) |
-| Cadence | 40 ms period (25 pkt/s); idle ≥21.8 ms guaranteed (~31 ms nominal) |
+| Cadence | 110 ms period (~9.1 pkt/s); idle ≥21.8 ms guaranteed (~100.8 ms nominal) |
 | Payload | 16-bit big-endian: 0–10000 deci-bar; 0xFF01–07 status/fault codes |
-| Availability | worst valid-packet gap ≈75 ms (fenced ADC-stall); ≈24 pkt/s sustained under fault; supports logger ≤~11–12.5 Hz |
+| Availability | worst valid-packet gap ≈145 ms (fenced ADC-stall); ≈8.7 pkt/s sustained under fault; supports logger ≤~4–4.5 Hz (**GATE Q7**) |
 | Fail-safe | stream alive ~ms after power-on (NO_READING); dead board = silence → logger 500 ms staleness rule (**deployment gate Q11**) |
 | Baud accuracy | +0.005 % (crystal + fractional divider) vs logger's ±2 % window |
 
@@ -132,7 +132,7 @@ fault. "12 effective bits" requires ≥1 native LSB of noise dither —
 |---|---|
 | Input supply | VS 5.5–28 V (chip rating; board's operating point per harness) |
 | Sensor excitation budget | VDDEXT 40 mA limit vs ~1 mA/bridge ×2–3 + mirror overhead — large headroom on paper (**UNVERIFIED**: measure actual mirror current) |
-| System power | **40 mW placeholder — UNMEASURED**; continuous 25 pkt/s TX adds ~21 % line-driving duty vs the old DC analog line (bench Test 13 measures reality) |
+| System power | **40 mW placeholder — UNMEASURED**; continuous ~9.1 pkt/s TX adds ~8 % line-driving duty vs the old DC analog line (bench Test 13 measures reality) |
 | **System temperature envelope** | Electronics: −40…+175 °C (T_j) · Sensor survival: −40…+150 °C · **Sensor ACCURACY: −10…+80 °C compensated** — the binding constraint downhole; beyond it, expect thermal drift until the temperature-LUT project lands (die-temp sensors already exist on ADC2) |
 
 ## 9. Verified vs. open

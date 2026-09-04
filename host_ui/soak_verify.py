@@ -25,7 +25,7 @@ What it checks, and why each one earns its place:
 
   RAMP TIMING
       Each ramp runs a fixed wall-clock window. Duration is measured by
-      COUNTING PACKETS (nominal 40 ms period), not by host timestamps: OS
+      COUNTING PACKETS (nominal 110 ms period), not by host timestamps: OS
       serial buffering delivers frames in chunks and would dominate the error
       on a 10-second window. Timestamps are reported alongside as a coarse
       cross-check only.
@@ -41,8 +41,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from link_decoder import LinkDecoder, decode_code, CODE_NAMES, VALUE_MAX  # noqa: E402
 
-PACKET_PERIOD_MS = 40.0     # link_protocol.md §4 — nominal, rebased per sync
-WORST_GAP_MS = 75.0         # one fenced stalled-ADC refresh
+PACKET_PERIOD_MS = 110.0    # link_protocol.md §4 — nominal, rebased per sync
+WORST_GAP_MS = PACKET_PERIOD_MS + 35.0   # period + one fenced stalled-ADC
+                                         # refresh. MUST track the period:
+                                         # hardcoded at 75.0 for the 40 ms
+                                         # era, it would flag every normal
+                                         # 110 ms gap as silence.
 NO_READING = 0xFF01
 BEACON_CODE = VALUE_MAX     # app_config.h SIM_AUTOSTART_BEACON_CODE
 
@@ -462,6 +466,22 @@ def main():
                                 % out_of_tol)
             print("\n%d ramp(s) measured, worst |error| = %.0f ms "
                   "(tolerance %.0f ms or 2%%)" % (checked, worst, tol))
+            # Durations here are measured by COUNTING PACKETS, so the
+            # packet grid has to line up with the refresh grid to read
+            # exact. It does only when the period divides the rate
+            # (1000/40 = 25 exactly, in the pre-4b era). At 110 ms it is
+            # 9.09 packets/refresh, and the residual drift shows up as a
+            # systematic ~1% error on every ramp. Say so, so nobody
+            # reads quantization as a real timing fault.
+            if args.rate % PACKET_PERIOD_MS:
+                print("NOTE: %.2f packets/refresh (%.0f ms period does not "
+                      "divide the %d ms rate) —\n"
+                      "      packet-counted durations quantize; expect a "
+                      "systematic error up to ~%.0f ms\n"
+                      "      per ramp. A period that divides the rate "
+                      "(e.g. 100 ms) reads exact."
+                      % (args.rate / PACKET_PERIOD_MS, PACKET_PERIOD_MS,
+                         args.rate, PACKET_PERIOD_MS))
         if skipped:
             print("%d ramp(s) not measurable in this capture (partial or "
                   "not reached)." % skipped)
@@ -493,7 +513,9 @@ def main():
         span = stamps[-1][1] - stamps[0][1]
         if span > 0:
             print("capture span %.1f s, %d frames -> %.2f packets/s "
-                  "(nominal 25.0)" % (span, dec.frames_ok, dec.frames_ok / span))
+                  "(nominal %.2f)" % (span, dec.frames_ok,
+                                      dec.frames_ok / span,
+                                      1000.0 / PACKET_PERIOD_MS))
 
     # ---- verdict ---------------------------------------------------------
     print("\n" + "=" * 72)

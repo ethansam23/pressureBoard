@@ -339,13 +339,16 @@ static void test_sim_clean(void)
            st.packets, st.min_gap / 1000.0, st.max_gap / 1000.0,
            st.max_total / 1000.0, st.min_idle / 1000.0,
            st.min_period / 1000.0);
-    CHECK(st.packets >= 240 && st.packets <= 251, "≈250 pkts in 10 s (%d)", st.packets);
+    CHECK(st.packets >= (int)(10000u / LINK_PACKET_PERIOD_MS) - 5 &&
+          st.packets <= (int)(10000u / LINK_PACKET_PERIOD_MS) + 1,
+          "≈%u pkts in 10 s (%d)", 10000u / LINK_PACKET_PERIOD_MS, st.packets);
     CHECK(st.orphan_syncs == 0, "no orphan syncs in clean run");
     CHECK(st.min_gap  >= 2000.0, "gap >2 ms (worst %.0f us)", st.min_gap);
     CHECK(st.max_gap  <= 5000.0, "gap <=5 ms (worst %.0f us)", st.max_gap);
     CHECK(st.max_total <= 9300.0, "packet <=9.3 ms (worst %.0f us)", st.max_total);
     CHECK(st.min_idle >= 20000.0, "idle >20 ms (worst %.0f us)", st.min_idle);
-    CHECK(st.min_period >= 38900.0, "period ≈40 ms (worst %.0f us)", st.min_period);
+    CHECK(st.min_period >= (LINK_PACKET_PERIOD_MS * 1000.0) - 1100.0,
+          "period ≈%u ms (worst %.0f us)", LINK_PACKET_PERIOD_MS, st.min_period);
     for (i = 0; i < (int)LINK_ABT_COUNT; i++)
     {
         CHECK(s->sm.aborts[i] == 0, "zero aborts (origin %d)", i);
@@ -383,8 +386,8 @@ static void test_sim_gap_stall(void)
     wire_stats_t st;
     sim_init(s, 0.0);
     s->live_code = 5000u;
-    /* Packet 2 sync starts ≈40 ms; its GAP phase ≈41-44 ms.                 */
-    sim_run(s, 2.0e6, 42000.0, 15000.0);
+    /* Packet 2 sync starts ≈PERIOD; its GAP phase spans the ~3 ms after.   */
+    sim_run(s, 2.0e6, (LINK_PACKET_PERIOD_MS + 2u) * 1000.0, 15000.0);
     validate_wire(s, &st, 0.0);
     CHECK(s->sm.aborts[LINK_ABT_DATA_DEADLINE] == 1,
           "exactly one deadline abort (got %u)",
@@ -393,7 +396,8 @@ static void test_sim_gap_stall(void)
     CHECK(st.max_total <= 9300.0, "no packet exceeds deadline even around stall");
     CHECK(st.min_idle >= 20000.0, "idle preserved through recovery (worst %.0f us)",
           st.min_idle);
-    CHECK(st.packets >= 45, "stream recovers (%d pkts in 2 s)", st.packets);
+    CHECK(st.packets >= (int)(2000u / LINK_PACKET_PERIOD_MS) - 2,
+          "stream recovers (%d pkts in 2 s)", st.packets);
     free(s);
 }
 
@@ -436,9 +440,9 @@ static void test_sim_fence_hold(void)
                 i += 3;
             }
         }
-        CHECK(max_gap_between <= 78000.0,
-              "max sync-to-sync <=78 ms under 34 ms hold (got %.1f ms)",
-              max_gap_between / 1000.0);
+        CHECK(max_gap_between <= (LINK_PACKET_PERIOD_MS * 1000.0) + 38000.0,
+              "max sync-to-sync <=%.0f ms under 34 ms hold (got %.1f ms)",
+              LINK_PACKET_PERIOD_MS + 38.0, max_gap_between / 1000.0);
     }
     free(s);
 }
@@ -457,7 +461,8 @@ static void test_sim_sync_ti_lost(void)
     validate_wire(s, &st, 0.0);
     CHECK(s->sm.aborts[LINK_ABT_SYNC_TIMEOUT] == 1, "one sync-timeout abort");
     CHECK(st.min_idle >= 20000.0, "idle preserved after TI loss");
-    CHECK(st.packets >= 45, "stream recovers after TI loss (%d)", st.packets);
+    CHECK(st.packets >= (int)(2000u / LINK_PACKET_PERIOD_MS) - 2,
+          "stream recovers after TI loss (%d)", st.packets);
     free(s);
 }
 
@@ -552,11 +557,11 @@ static void test_wraparound(void)
     act = link_sm_step(&sm, &in);
     CHECK(sm.st == LINK_ST_IDLE && sm.pkts_ok == 1u, "packet 1 done pre-wrap");
     in.tx_done = false;
-    /* Next packet due at t0+40 = 0x00000018 — PAST the wrap.                */
-    in.now = t0 + 30u;   /* 0x0000000E */
+    /* Next packet due one PERIOD out — PAST the wrap.                       */
+    in.now = t0 + LINK_PACKET_PERIOD_MS - 10u;
     act = link_sm_step(&sm, &in);
     CHECK(act == LINK_ACT_NONE, "not due yet across wrap");
-    in.now = t0 + 40u;   /* 0x00000018 */
+    in.now = t0 + LINK_PACKET_PERIOD_MS;
     act = link_sm_step(&sm, &in);
     CHECK(act == LINK_ACT_SEND_SYNC, "period fires correctly across wrap");
     CHECK(sm.aborts[LINK_ABT_BAD_STATE] == 0, "no wrap corruption");

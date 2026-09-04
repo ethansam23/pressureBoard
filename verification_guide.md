@@ -69,7 +69,7 @@ Capture several packets; measure:
 | Sync stop-bit end → first data start bit (gap) | **2.9 – 5.0 ms** | ~3.4–4.1 ms | _____ |
 | Spacing between the 3 data bytes | back-to-back (no gap > 1 bit) | 0 | _____ |
 | Checksum end → next line activity (idle) | **≥ 21.8 ms** | ~31 ms | _____ |
-| Sync-start → sync-start (period) | 40 ms ± 1 ms | 40 ms | _____ |
+| Sync-start → sync-start (period) | 110 ms ± 1 ms | 110 ms | _____ |
 | Bit width (baud accuracy) | 104.2 µs ± 2 % | 104.2 µs | _____ |
 | Idle-high voltage | per logger divider spec | _____ | _____ |
 
@@ -108,7 +108,7 @@ Capture several packets; measure:
       ≈ seconds-since-boot only here at the first unlock)
 - [ ] `CONSOLE LOCK` → goodbye line, then scope shows ≥ 21.8 ms quiet (see
       Test 2 idle-floor note), then a SINGLE packet (no burst), then normal
-      40 ms cadence
+      110 ms cadence
 - [ ] Unlock again, wait 5+ min without typing → firmware auto-relocks and
       the stream resumes on its own
 - [ ] Host monitor: "Enter Bench Mode" does all of the above from the GUI;
@@ -118,7 +118,7 @@ Capture several packets; measure:
 
 Passive monitor connected, 5+ minutes:
 
-- [ ] `Chk errors` stays **0**; `Packets` climbs ~25/s; `Rate` ≈ 25.0/s
+- [ ] `Chk errors` stays **0**; `Packets` climbs ~9/s; `Rate` ≈ 9.1/s
 - [ ] `Link` tile shows `live` throughout (never STALE while powered)
 - [ ] Pull the board's power mid-soak → STALE indicator within ~0.5 s (this
       is the logger's staleness scenario made visible)
@@ -249,7 +249,7 @@ with `AUTO` on + `RATE 100`, 10+ minutes:
 ## Test 13 — Power readout + baseline measurement
 
 - [ ] `POWER` → `Power: 40 mW (continuous)` (placeholder)
-- [ ] **Measure actual supply current** in packet mode (25 pkt/s TX) and note
+- [ ] **Measure actual supply current** in packet mode (~9.1 pkt/s TX) and note
       for the power-budget update: _____ mA @ _____ V
 
 ## Test 14 — LED pattern summary
@@ -392,9 +392,16 @@ against `host_tests/refs/phaseB_rate1000.csv`.
 - [ ] Worst |error|: _____ ms (tolerance is 80 ms or 2%, whichever is larger)
 - [ ] `RESULT: PASS`
 
-Durations are measured by counting packets against the 40 ms nominal period,
+Durations are measured by counting packets against the 110 ms nominal period,
 not by host timestamps — OS serial buffering would otherwise dominate the
 error on the 10-second windows.
+
+**Expect a systematic ~1 % error on every ramp.** 110 ms does not divide the
+1000 ms refresh (9.09 packets/refresh), so the packet grid drifts against the
+refresh grid and packet-counted durations quantize. This read exact while the
+period was 40 ms (25 packets/refresh). `soak_verify.py` prints a NOTE saying
+so — a uniform ~1 % shortfall across all ramps is quantization, not a timing
+fault; a *single* ramp out of line is the real signal.
 
 ## Test C — High-resolution stress (Phase B at RATE 100, 1 h)
 
@@ -423,9 +430,9 @@ The real run: 2,160,000 packets, ~8.6 MB at the tap.
       full run) and flags the surplus
 - [ ] All 362 ramps within tolerance
 - [ ] `checksum err : 0` over the whole run
-- [ ] No silence beyond the 75 ms worst legitimate gap
+- [ ] No silence beyond the 145 ms worst legitimate gap
 - [ ] `aborts=0 skips=0` in `STATUS` afterwards
-- [ ] Packets received: _____ / 2,160,000   resets: _____   worst gap: _____ ms
+- [ ] Packets received: _____ / ~785,000   resets: _____   worst gap: _____ ms
 - [ ] Logger's own recording compared against the tap: _____ (15b only)
 
 > **Do not change `RATE`, `THRESH`, `RANGE`, `PROBE` or run `CAL STORE` during

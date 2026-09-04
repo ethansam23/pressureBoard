@@ -16,7 +16,7 @@ exactly one of two things at any moment (strict mutual exclusion in firmware):
 
 | Line state | What's on the wire | Analyzer behavior |
 |---|---|---|
-| **PACKET MODE** (power-on default; the only mode of production firmware) | Binary packets, ~every 40 ms, nothing else | Decode passively (§3). Analyzer TX must stay idle/high-Z |
+| **PACKET MODE** (power-on default; the only mode of production firmware) | Binary packets, ~every 110 ms, nothing else | Decode passively (§3). Analyzer TX must stay idle/high-Z |
 | **CONSOLE MODE** (debug firmware, after `CONSOLE UNLOCK`) | ASCII console traffic only — **the packet stream is suspended** | Send commands, parse replies (§4–§5) |
 
 The analyzer must track which mode it believes the line is in, and expect the
@@ -52,8 +52,8 @@ Timing envelope (what a healthy transmitter produces — flag violations):
 | Sync start → checksum stop-end (packet) | ≤ 9.2 ms (spec < 10) |
 | Data bytes | back-to-back, no inter-byte gaps |
 | Checksum end → next sync (idle) | ≥ 21.8 ms guaranteed (~31 ms nominal; see verification_guide.md idle-floor note) |
-| Sync-start → sync-start (period) | 40 ms nominal |
-| Max legitimate gap between valid packets | ≈ 75 ms (fenced stall) — anything longer, see staleness |
+| Sync-start → sync-start (period) | 110 ms nominal |
+| Max legitimate gap between valid packets | ≈ 145 ms (fenced stall) — anything longer, see staleness |
 
 ### 3.2 Decode algorithm (reference C — port as-is)
 
@@ -135,7 +135,7 @@ Priority (one code per packet; a higher fault hides lower ones on the wire —
 ### 3.4 Staleness — mandatory display rule
 
 **No checksum-valid frame for ≥ 500 ms → display `NO DATA / STALE`** (do not
-keep showing the last value as if live). Legitimate gaps never exceed ~75 ms;
+keep showing the last value as if live). Legitimate gaps never exceed ~145 ms;
 a silent line means a dead/resetting transmitter, a cut wire — or simply that
 someone (you) opened the console and the stream is suspended. Distinguish the
 last case by tracking your own mode (§1).
@@ -146,7 +146,7 @@ last case by tracking your own mode (§1).
 LOCKED ──"CONSOLE UNLOCK\r\n"──▶ UNLOCKING ──▶ UNLOCKED (console mode)
   ▲                                                  │
   └──── power cycle ── 5-min RX inactivity ── "CONSOLE LOCK\r\n" ◀┘
-                    (RESUMING: ≥22 ms quiet → single packet → 40 ms cadence)
+                    (RESUMING: ≥22 ms quiet → single packet → 110 ms cadence)
 ```
 
 **LOCKED (boot state, always):**
@@ -186,7 +186,7 @@ prominently.
 **Re-lock paths:** your `CONSOLE LOCK` (reply below) · 5 minutes without any
 RX byte reaching the firmware (auto-relock — the goodbye line arrives
 unprompted) · power cycle (instant, silent). After the goodbye line drains:
-≥ 22 ms of silence, then ONE packet, then normal 40 ms cadence — reset your
+≥ 22 ms of silence, then ONE packet, then normal 110 ms cadence — reset your
 staleness timer on re-entry to packet mode.
 
 **Transient lines to tolerate anywhere while unlocked** (slated for removal):
@@ -313,7 +313,7 @@ return usage: `ERR: RATE <100-5000 ms>` · `ERR: THRESH <1-4092>` ·
 ## 6. Scripted workflows (expected traffic end-to-end)
 
 **A. Passive monitor (default duty):** decode frames → display per §3.3 →
-staleness per §3.4 → maintain counters (frames, checksum errors, rate ≈25/s).
+staleness per §3.4 → maintain counters (frames, checksum errors, rate ≈9.1/s).
 Never transmit.
 
 **B. Full calibration run:**

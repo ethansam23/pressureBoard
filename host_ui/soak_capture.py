@@ -44,7 +44,7 @@ except ImportError:
 BAUD = 9600                 # link_protocol.md §1 — not the old 115200 console
 ROTATE_BYTES = 32 << 20     # 32 MiB per chunk file
 READ_CHUNK = 4096
-# 4 bytes/packet at 25 packets/s = 100 B/s, so 24 h is only ~8.6 MB. Rotation
+# 4 bytes/packet at ~9.1 packets/s = ~36 B/s, so 24 h is only ~3.1 MB. Rotation
 # is cheap insurance for a run that overshoots or gets left going.
 
 

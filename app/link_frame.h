@@ -58,11 +58,21 @@
  *  - DEADLINE 5: data admitted only while (now - sync_start) <= 5 ticks
  *                => absolute packet (sync start bit -> checksum stop end)
  *                <= 5.999 + 3.175 = 9.17 ms  (0.83 ms margin below 10)
- *  - PERIOD 40:  25 pkt/s nominal; rebased on ACTUAL sync start (no catch-up)
- *  - IDLE 22:    measured from the TI tick of the last byte => real wire
- *                idle >= ~20.9 ms even at worst tick quantization
+ *  - PERIOD 110: ~9.1 pkt/s nominal; rebased on ACTUAL sync start (no catch-up).
+ *                Nominal wire idle = 110 - 9.17 = ~100.8 ms. Was 40 ms
+ *                (25 pkt/s) through step 4b; stretched on request to put
+ *                ~100 ms between packets instead of riding the protocol's
+ *                20 ms floor. NOTE: this cuts the 2x-rule logger ceiling
+ *                from 12.5 Hz to ~4.5 Hz and GATE Q7 is still open -- see
+ *                link_protocol.md 4.
+ *  - IDLE 22:    UNCHANGED. This guards the logger's >20 ms floor, which is
+ *                logger-defined and not ours to move; measured from the TI
+ *                tick of the last byte => real wire idle >= ~20.9 ms even at
+ *                worst tick quantization. It stays well under the ~100.8 ms
+ *                nominal, so the PERIOD drives the cadence and this remains a
+ *                safety net for overdue/perturbed packets.
  ******************************************************************************/
-#define LINK_PACKET_PERIOD_MS   40u
+#define LINK_PACKET_PERIOD_MS   110u
 #define LINK_SYNC_GAP_MS        4u
 #define LINK_DATA_DEADLINE_MS   5u
 #define LINK_IDLE_MIN_MS        22u

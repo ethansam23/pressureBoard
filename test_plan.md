@@ -85,7 +85,7 @@ J-Link **detached**, board on a bench supply.
 | Step | Test | What it proves |
 |---|---|---|
 | 1.1 | Test 1 | Packets-only boot; no ASCII at boot; fail-safe `NO_READING` |
-| 1.2 | **Test 2** ★ | Wire timing on a scope — sync gap, packet ≤ 9.17 ms, idle ≥ 22 ms, 40 ms period |
+| 1.2 | **Test 2** ★ | Wire timing on a scope — sync gap, packet ≤ 9.17 ms, idle ≥ 22 ms, 110 ms period |
 | 1.3 | Test 3 | Console mutual exclusion — packets and text never interleave |
 | 1.4 | Test 5 | `LINKTEST` payload-sacred vectors — `0x7F` transmitted verbatim |
 | 1.5 | Test 12 | 10-minute watchdog soak, standalone |
@@ -130,7 +130,7 @@ python soak_verify.py --capture logs/ladder --reference ../host_tests/refs/phase
 
 | Step | Gate |
 |---|---|
-| 2.1 | Arming prints each step; preflight reports ~25 packets/s |
+| 2.1 | Arming prints each step; preflight reports ~9.1 packets/s |
 | 2.2 | `RESULT: PASS` |
 | 2.3 | All 20 ramps `ok`; worst \|error\| recorded |
 
@@ -149,7 +149,7 @@ the report tells you which.
 **Test A.** The only test that proves all 10,001 deci-bar codes encode and
 transmit. Runs unattended — start it and leave.
 
-**Gate:** `coverage : 100.0000%`, zero checksum errors, zero gaps > 75 ms.
+**Gate:** `coverage : 100.0000%`, zero checksum errors, zero gaps > 145 ms.
 
 This also sweeps every payload-sacred case organically: the 39 codes whose LSB
 is `0x7F` (127, 383, 639 … 9855), the 39 whose checksum is `0x7F` (128, 383,
@@ -198,7 +198,7 @@ the 5-minute auto-relock is a backstop, not a plan.
 - `resets : none`
 - All 362 ramps within tolerance
 - `checksum err : 0` over the whole run
-- No silence beyond 75 ms
+- No silence beyond 145 ms
 - `aborts=0 skips=0` in `STATUS` afterwards
 
 **Record:** packets received of 2,160,000; worst gap; worst ramp error.

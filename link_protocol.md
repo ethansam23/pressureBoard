@@ -35,12 +35,13 @@ below are GATES, marked as such, and must be confirmed before deployment._
   not a CRC**. Known limitations (accepted; protocol is logger-defined):
   swapping MSB/LSB preserves the sum; compensating byte errors pass; random
   corruption is accepted ~1/256. The defense is continuous retransmission —
-  any single bad packet is displaced 40 ms later.
+  any single bad packet is displaced 110 ms later.
 - **Total packet** (sync start bit → checksum stop-bit end): firmware
   guarantees **≤ 9.17 ms** (spec: <10 ms; test limit 9.3 ms; scope limit 9.5 ms).
-- **Idle** — checksum end → next sync: **≥ 22 ms enforced**, ~31 ms nominal
-  (spec: >20 ms).
-- **Period** — sync-start → sync-start, **40 ms nominal (25 packets/s)**,
+- **Idle** — checksum end → next sync: **≥ 22 ms enforced**, **~100.8 ms
+  nominal** (spec: >20 ms). The enforced floor still guards the logger's
+  20 ms line and is unchanged; the nominal gap is set by the period.
+- **Period** — sync-start → sync-start, **110 ms nominal (~9.1 packets/s)**,
   rebased on each actual sync start. Overdue packets (after an NVM save or a
   fenced stall) fire once at the first legal opportunity — **never a
   catch-up burst**.
@@ -96,10 +97,10 @@ here). **Q20.**
 
 | Metric | Value |
 |---|---|
-| Nominal packet rate | 25 /s (40 ms period) |
-| Max interval between valid packet starts | ≈ **75 ms** (one fenced stalled-ADC refresh, ≈once/second while the ADC is faulted) · ≈ **65 ms** around an NVM save (bench-command-triggered only) |
-| Sustained rate during an ADC fault | ≈ 24 valid packets/s — all packets complete; the design produces **no partial packets** for any predictable stall |
-| Supported logger record rate (2× rule) | ≤ 12.5 Hz nominal, ≈ 11 Hz under worst-case fault conditions. **GATE Q7:** confirm the logger's actual rate AND whether "2×" applies to average rate or maximum gap |
+| Nominal packet rate | ~9.1 /s (110 ms period) — was 25 /s (40 ms) through step 4b |
+| Max interval between valid packet starts | ≈ **145 ms** (one fenced stalled-ADC refresh, ≈once/second while the ADC is faulted) · ≈ **135 ms** around an NVM save (bench-command-triggered only) |
+| Sustained rate during an ADC fault | ≈ 8.7 valid packets/s — all packets complete; the design produces **no partial packets** for any predictable stall |
+| Supported logger record rate (2× rule) | ≤ **4.5 Hz** nominal, ≈ 4 Hz under worst-case fault conditions — **down from 12.5 / 11 Hz** at the old 40 ms period. **GATE Q7 (now load-bearing):** the 110 ms period was adopted on the tool owner's call with Q7 still open. If the logger records above ~4.5 Hz the 2× rule is violated and the period must go back down. Confirm the logger's actual rate AND whether "2×" applies to average rate or maximum gap |
 | Bench exception | While a debug-build console session is open (`CONSOLE UNLOCK`), the stream is **suspended entirely** — the line carries text instead. Mutual exclusion: packets and text never interleave |
 
 ## 5. Dead-transmitter detection — the logger's staleness rule (DEPLOYMENT BLOCKER)
@@ -112,8 +113,10 @@ making a tool that died at hour 2 indistinguishable from 70 flat hours.
 
 **Required:** if no checksum-valid packet arrives within a timeout, the
 logger must record a distinct "no data" marker (not the stale value).
-Recommended timeout: **500 ms** (≈12 nominal packet slots; > the 75 ms worst
-legitimate gap by 6×). **GATE Q1/Q11/Q18/Q19.**
+Recommended timeout: **500 ms** (≈4.5 nominal packet slots; > the 145 ms worst
+legitimate gap by ~3.4×). The margin was 12 slots / 6× at the 40 ms period —
+still workable, but a logger that debounces over a couple of slots now has far
+less room. **GATE Q1/Q11/Q18/Q19.**
 
 ## 6. Timing measurement note (TI hypothesis)
 

@@ -22,7 +22,7 @@ HARNESS = os.path.join(ROOT, "host_tests", "test_link_frame")
 VERIFY = os.path.join(HERE, "soak_verify.py")
 
 RATE_MS = 1000
-PACKET_MS = 40
+PACKET_MS = 110
 PKTS_PER_REFRESH = RATE_MS // PACKET_MS      # 25
 
 
@@ -118,8 +118,15 @@ class SoakVerifyTest(unittest.TestCase):
         rc, out = run_verify(self._cap("clean"), self.ref)
         self.assertEqual(rc, 0, out)
         self.assertIn("RESULT: PASS", out)
-        # The ladder's whole point: every ramp measured, none out of tolerance.
-        self.assertIn("worst |error| = 0 ms", out)
+        # The ladder's whole point: every ramp measured, none out of
+        # tolerance. This asserted "worst |error| = 0 ms" while the period
+        # was 40 ms, which divided the 1000 ms rate exactly (25
+        # packets/refresh). At 110 ms it is 9.09, so packet-counted
+        # durations quantize and every ramp carries a systematic ~1%
+        # error. Assert the property the ladder actually gates on.
+        self.assertIn("20 ramp(s) measured", out)
+        self.assertNotIn("outside the duration tolerance", out)
+        self.assertIn("packets/refresh", out)
 
     def test_status_block_is_not_mistaken_for_a_reset(self):
         """The profile emits NO_READING once per cycle by design."""
